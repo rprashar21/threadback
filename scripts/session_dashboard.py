@@ -920,13 +920,30 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
 
         to_regenerate.append((slug, summarized, display_name, signature))
 
-    for slug, summarized, display_name, signature in to_regenerate[:PROJECT_RECAP_CAP]:
-        recap_text = ss.run_project_recap(slug, summarized)
+    to_regenerate = to_regenerate[:PROJECT_RECAP_CAP]
+
+    def _recap(item: tuple[str, list[dict], str, list[list[str]]]) -> tuple[str, str, str | None]:
+        slug, summarized, display_name, _signature = item
+        return slug, display_name, ss.run_project_recap(slug, summarized)
+
+    # Each recap is an independent `claude -p` subprocess against a different
+    # project's cache file, so — same reasoning as the session-summary pool
+    # above — there's no reason to serialize them. Sequentially, a full
+    # PROJECT_RECAP_CAP run could block /recap for minutes with zero
+    # feedback; in parallel it's bounded by the single slowest call.
+    if to_regenerate:
+        with ThreadPoolExecutor(max_workers=len(to_regenerate)) as pool:
+            results = list(pool.map(_recap, to_regenerate))
+    else:
+        results = []
+
+    by_slug_signature = {slug: signature for slug, _s, _d, signature in to_regenerate}
+    for slug, display_name, recap_text in results:
         if recap_text:
             _write_project_recap(slug, {
                 "recap_text": recap_text,
                 "generated_at": _iso(now),
-                "based_on": signature,
+                "based_on": by_slug_signature[slug],
             })
             recaps[display_name] = recap_text
         else:

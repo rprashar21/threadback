@@ -41,11 +41,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_ROOT="$HOME/.claude/session-logs"
-DEBUG_LOG="$LOG_ROOT/.last-payload.json"
 mkdir -p "$LOG_ROOT"
 
 PAYLOAD="$(cat)"
-echo "$PAYLOAD" > "$DEBUG_LOG"
 
 TRANSCRIPT_PATH="$(echo "$PAYLOAD" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("transcript_path",""))' 2>/dev/null || true)"
 CWD="$(echo "$PAYLOAD" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("cwd",""))' 2>/dev/null || true)"

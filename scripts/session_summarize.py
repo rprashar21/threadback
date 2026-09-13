@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -39,6 +40,68 @@ VALID_STATUSES = {"Completed", "In Progress", "Blocked", "Unknown"}
 # SUMMARIZER_SCRATCH_SLUG there). This is what actually prevents the
 # cascade, independent of the env var guard.
 SUMMARIZER_SCRATCH_DIR = Path.home() / ".claude" / "session-logs" / ".summarizer-scratch"
+
+# Every claude -p failure (missing binary, timeout, non-zero exit, empty
+# output) used to be swallowed entirely — the only visible symptom was a
+# session stuck on "Not yet summarized" forever with no way to tell why.
+# This appends one line per failure so that's diagnosable after the fact.
+ERROR_LOG = Path.home() / ".claude" / "session-logs" / "summarizer-errors.log"
+
+
+def _log_failure(label: str, reason: str, stderr_tail: str = "") -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"[{ts}] {label}: {reason}"
+    if stderr_tail.strip():
+        line += f" — stderr: {stderr_tail.strip()[-500:]!r}"
+    try:
+        ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ERROR_LOG.open("a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _terminate_process_group(proc: subprocess.Popen, grace_secs: float = 5) -> None:
+    """Kill the whole process group, not just `proc` itself.
+
+    `start_new_session=True` at spawn time makes this process its own
+    session/group leader (pgid == pid). `proc.terminate()` alone only
+    signals that one process — if `claude -p` has spawned its own child
+    (a tool subprocess, or a hung one), that child keeps running as an
+    orphan, and if anything downstream is reading its stderr via a pipe
+    (rather than a plain file), that read blocks forever waiting for the
+    orphan to close its inherited fd. Signaling the whole group avoids both
+    problems.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace_secs)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _read_and_discard(path: Path) -> str:
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return ""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return text
 
 PROMPT_TEMPLATE = (
     "Read the Claude Code session transcript at {transcript_path} (JSONL format). "
@@ -128,31 +191,41 @@ def run_bounded_summary(
     env["CLAUDE_SESSION_LOG_SUMMARIZER"] = "1"
 
     SUMMARIZER_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    stderr_path = transcript.parent / f".tmp-summary-stderr-{session_id}-{os.getpid()}.log"
 
     try:
-        proc = subprocess.Popen(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Read,Write"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            cwd=str(SUMMARIZER_SCRATCH_DIR),
-            start_new_session=True,
-        )
-    except OSError:
+        # stderr goes to a plain file, not a pipe: a pipe would make any
+        # failure-path read block until every process holding the write end
+        # (including a grandchild the subprocess spawns) closes it, which
+        # can defeat the timeout below entirely. See _terminate_process_group.
+        with stderr_path.open("wb") as stderr_f:
+            proc = subprocess.Popen(
+                ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Read,Write"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_f,
+                env=env,
+                cwd=str(SUMMARIZER_SCRATCH_DIR),
+                start_new_session=True,
+            )
+    except OSError as e:
+        _log_failure(f"session summary ({session_id})", f"failed to launch claude -p: {e}")
         return False
 
+    timed_out = False
     try:
         proc.wait(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        timed_out = True
+        _terminate_process_group(proc)
 
     if not body_path.exists() or body_path.stat().st_size == 0:
+        stderr_text = _read_and_discard(stderr_path)
+        reason = f"timed out after {timeout_secs}s" if timed_out else f"exit code {proc.returncode}, no output written"
+        _log_failure(f"session summary ({session_id})", reason, stderr_text)
         return False
+
+    _read_and_discard(stderr_path)  # cleanup only; call succeeded, nothing to log
 
     text = body_path.read_text()
     try:
@@ -217,31 +290,37 @@ def run_project_recap(
     env = dict(os.environ)
     env["CLAUDE_SESSION_LOG_SUMMARIZER"] = "1"
     SUMMARIZER_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    stderr_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-recap-stderr-{project_slug}-{os.getpid()}.log"
 
     try:
-        proc = subprocess.Popen(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Write"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            cwd=str(SUMMARIZER_SCRATCH_DIR),
-            start_new_session=True,
-        )
-    except OSError:
+        with stderr_path.open("wb") as stderr_f:
+            proc = subprocess.Popen(
+                ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Write"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_f,
+                env=env,
+                cwd=str(SUMMARIZER_SCRATCH_DIR),
+                start_new_session=True,
+            )
+    except OSError as e:
+        _log_failure(f"project recap ({project_slug})", f"failed to launch claude -p: {e}")
         return None
 
+    timed_out = False
     try:
         proc.wait(timeout=timeout_secs)
     except subprocess.TimeoutExpired:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        timed_out = True
+        _terminate_process_group(proc)
 
     if not body_path.exists() or body_path.stat().st_size == 0:
+        stderr_text = _read_and_discard(stderr_path)
+        reason = f"timed out after {timeout_secs}s" if timed_out else f"exit code {proc.returncode}, no output written"
+        _log_failure(f"project recap ({project_slug})", reason, stderr_text)
         return None
+
+    _read_and_discard(stderr_path)
 
     text = body_path.read_text().strip()
     try:
