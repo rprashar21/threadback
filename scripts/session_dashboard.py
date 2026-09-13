@@ -131,6 +131,27 @@ NO_ACTION_RE = re.compile(
 )
 OPTIONAL_SPLIT_RE = re.compile(r"optional[^:]*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
+# Known low-information lead-ins that make_title() strips before truncating —
+# e.g. "Ran the /recap skill to catch up on..." or "User asked for an
+# explanation of...". Purely mechanical prefix removal on already-stored
+# text: never invents content, never touches the underlying worked_on/summary
+# fields, only how a title is DERIVED from them for display.
+TITLE_LEADIN_RES = [
+    re.compile(r"^ran\s+(the\s+)?/?[\w-]+\s+(skill|command|slash command)\b.{0,20}?\bto\s+", re.IGNORECASE),
+    re.compile(r"^(the\s+)?user\s+asked\s+(for|to|whether|if)\s+", re.IGNORECASE),
+    re.compile(r"^(the\s+)?user\s+requested\s+", re.IGNORECASE),
+    re.compile(r"^(i\s+)?(was\s+asked\s+to|helped\s+(the\s+)?user)\s+", re.IGNORECASE),
+]
+
+# A session with no real timestamp gets a "1970-01-01T00:00:00Z" fallback
+# (see build_session_data/load_legacy_entry) so sorting always has a value to
+# compare against — but that fallback must never be presented to a human as
+# a real date (e.g. "20709d ago"), and must never be treated as equally
+# comparable to a genuine, if old, timestamp. Anything before this floor is
+# certainly the fallback, not real session activity (this pipeline didn't
+# exist before then).
+PLAUSIBLE_TS_FLOOR_YEAR = 2020
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -147,6 +168,23 @@ def _parse_ts(ts: str | None) -> datetime | None:
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_plausible_ts(iso: str | None) -> bool:
+    """True only for a timestamp that could plausibly be real session
+    activity — not missing, not a parse failure, and not the epoch-era
+    fallback used when nothing else is known. Used to gate both display
+    ("Date unavailable" vs a real date) and sort order (a session/project
+    with no real timestamp must never be treated as equally recent — or more
+    recent — than one with a genuine, even old, timestamp)."""
+    dt = _parse_ts(iso)
+    if dt is None:
+        return False
+    if dt.year < PLAUSIBLE_TS_FLOOR_YEAR:
+        return False
+    if dt > _now() + timedelta(days=1):  # small clock-skew tolerance
+        return False
+    return True
 
 
 # --- Legacy .md parsing (unchanged parsing rules, kept for history) --------
@@ -650,6 +688,18 @@ def build_resume_command(cwd: str | None, session_id: str | None) -> str | None:
     return f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
 
 
+def resume_unavailable_reason(cwd: str | None, session_id: str | None) -> str | None:
+    """Why build_resume_command() returned None, so the UI can disable the
+    action with a specific explanation instead of a generic "unavailable"."""
+    if not cwd and not session_id:
+        return "no project path or session id on record"
+    if not cwd:
+        return "no project path on record"
+    if not session_id:
+        return "no session id on record"
+    return None
+
+
 def _strip_markdown_inline(text: str) -> str:
     text = re.sub(r"^[-*]\s+", "", text.strip())
     text = re.sub(r"`([^`]+)`", r"\1", text)
@@ -678,9 +728,23 @@ def make_summary(worked_on: str, completed: str) -> str:
     return "No summary available."
 
 
+def _strip_title_leadin(basis: str) -> str:
+    """Strip a known low-information lead-in ("Ran the /recap skill to...",
+    "User asked for...") so the title starts at the actual substance instead
+    of restating that a skill ran or a question was asked. Falls back to the
+    untouched basis if stripping would leave too little to make a title from
+    — never truncates into a meaningless fragment."""
+    for pattern in TITLE_LEADIN_RES:
+        stripped = pattern.sub("", basis, count=1)
+        if stripped != basis and len(stripped.split()) >= 3:
+            return stripped[:1].upper() + stripped[1:]
+    return basis
+
+
 def make_title(summary: str, worked_on: str, project: str) -> str:
     basis = summary if summary and summary not in ("No summary available.", "Not yet summarized.") else _first_sentence(worked_on)
     basis = basis.rstrip(".!?")
+    basis = _strip_title_leadin(basis)
     words = basis.split()
     if not words:
         return f"{project} session"
@@ -802,10 +866,12 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
                 "next_action_required": next_required,
                 "next_action_optional": next_optional,
                 "resume_command": build_resume_command(cwd, c.session_id),
+                "resume_unavailable_reason": resume_unavailable_reason(cwd, c.session_id),
                 "summary_source": summary_source,
                 "summary_at": summary_at,
                 "pending_label": pending_label,
                 "force_command": force_command,
+                "last_activity_valid": _is_plausible_ts(last_active_iso),
                 "context_peak_tokens": usage_stats["peak_context_tokens"] if usage_stats else None,
                 "context_total_output_tokens": usage_stats["total_output_tokens"] if usage_stats else None,
             }
@@ -977,10 +1043,12 @@ def add_legacy_no_id_entries(data: list[dict], no_id_entries: list[LegacyEntry])
                 "next_action_required": next_required,
                 "next_action_optional": next_optional,
                 "resume_command": None,
+                "resume_unavailable_reason": resume_unavailable_reason(e.cwd, None),
                 "summary_source": "legacy_md",
                 "summary_at": e.ended_at,
                 "pending_label": None,
                 "force_command": None,
+                "last_activity_valid": _is_plausible_ts(e.ended_at),
             }
         )
 
@@ -1001,7 +1069,11 @@ def _relative_label(iso_ts: str | None) -> str:
 
 
 def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) -> str:
-    data.sort(key=lambda d: d["ended_at"], reverse=True)
+    # last_activity_valid first so a session with no real timestamp always
+    # sorts after every session with a genuine one, never intermixed by a
+    # plain string compare on ended_at (which would otherwise put the
+    # 1970-01-01 fallback last only by coincidence of string ordering).
+    data.sort(key=lambda d: (d["last_activity_valid"], d["ended_at"]), reverse=True)
     data_json = json.dumps(data).replace("</", "<\\/")
     recaps_json = json.dumps(project_recaps or {}).replace("</", "<\\/")
 
@@ -1039,17 +1111,13 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   header.page-head {{ padding: 20px 0 12px; }}
   h1 {{ font-size: 1.4rem; margin: 0 0 4px; }}
   .subtitle {{ color: var(--muted); font-size: 0.85rem; }}
-  .privacy-note {{ color: var(--muted); font-size: 0.78rem; margin: 4px 0 16px; line-height: 1.4; }}
-  .privacy-note code {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }}
-
-  .overview {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }}
-  button.stat {{ flex: 1 1 150px; background: var(--card-bg); color: var(--fg); border: 1px solid var(--border);
-           border-radius: 8px; padding: 10px 16px; text-align: left; cursor: pointer; font: inherit; }}
-  button.stat:hover {{ border-color: var(--accent); }}
-  button.stat[aria-pressed="true"] {{ border-color: var(--accent); border-width: 2px;
-           background: color-mix(in srgb, var(--accent) 12%, var(--card-bg)); }}
-  button.stat .num {{ font-size: 1.4rem; font-weight: 600; display: block; }}
-  button.stat .label {{ font-size: 0.75rem; color: var(--muted); }}
+  .how-summaries-work {{ color: var(--muted); font-size: 0.78rem; margin: 4px 0 16px; line-height: 1.4; }}
+  .how-summaries-work summary {{ cursor: pointer; color: var(--accent); font-weight: 600; list-style: none; }}
+  .how-summaries-work summary::-webkit-details-marker {{ display: none; }}
+  .how-summaries-work summary::before {{ content: "▸ "; }}
+  .how-summaries-work[open] summary::before {{ content: "▾ "; }}
+  .how-summaries-work p {{ margin: 6px 0 0; }}
+  .how-summaries-work code {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }}
 
   .controls {{ position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; flex-wrap: wrap;
            align-items: center; padding: 10px 0; margin-bottom: 8px; background: var(--bg);
@@ -1071,10 +1139,10 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
            border: 1px solid var(--border); border-radius: 12px; padding: 16px; cursor: pointer;
            font: inherit; color: var(--fg); }}
   .project-card:hover {{ border-color: var(--accent); }}
-  .project-card-head {{ margin-bottom: 8px; }}
-  .project-card-chips {{ font-size: 0.76rem; color: var(--unknown); font-weight: 600; margin-bottom: 10px; }}
+  .project-card-head {{ margin-bottom: 4px; }}
+  .project-card-activity {{ font-size: 0.74rem; color: var(--muted); margin-bottom: 10px; }}
   .project-recap {{ font-size: 0.82rem; color: var(--fg); line-height: 1.4; margin-bottom: 10px; }}
-  .project-preview {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }}
+  .project-preview {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }}
   .preview-row {{ display: flex; align-items: center; gap: 7px; font-size: 0.82rem; }}
   .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; }}
   .preview-dot.completed {{ background: var(--completed); }}
@@ -1083,7 +1151,9 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .preview-dot.unknown {{ background: var(--unknown); }}
   .preview-title {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   .preview-date {{ color: var(--muted); font-size: 0.74rem; white-space: nowrap; }}
-  .project-card-count {{ font-size: 0.74rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; }}
+  .view-all-row {{ display: block; background: none; border: none; color: var(--accent); font: inherit;
+           font-size: 0.78rem; text-decoration: underline; cursor: pointer; padding: 4px 0 0; text-align: left; }}
+  .project-card-count {{ font-size: 0.74rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px; }}
 
   /* --- project detail view --- */
   .back-link {{ background: none; border: none; color: var(--accent); cursor: pointer; font: inherit;
@@ -1120,6 +1190,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .btn-primary {{ background: var(--accent); color: white; border-color: var(--accent); }}
   .btn-secondary {{ background: none; color: var(--fg); border-color: var(--border); }}
   .btn-primary.copied {{ background: var(--completed); border-color: var(--completed); }}
+  .btn:disabled {{ cursor: not-allowed; opacity: 0.5; }}
 
   .details {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }}
   .field {{ margin-bottom: 14px; font-size: 0.88rem; line-height: 1.5; max-width: 68ch; }}
@@ -1141,8 +1212,6 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   button:focus-visible, input:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
 
   @media (max-width: 480px) {{
-    .overview {{ display: grid; grid-template-columns: 1fr 1fr; }}
-    button.stat {{ flex: none; }}
     .card {{ padding: 12px; }}
     .card-title {{ white-space: normal; }}
   }}
@@ -1152,20 +1221,22 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
 <div class="wrap">
   <header class="page-head">
     <h1>Claude Work Recap</h1>
-    <div class="subtitle">Generated {generated_at} · dashboard data stays on this machine</div>
+    <div class="subtitle" id="header-stats">Generated {generated_at}</div>
   </header>
 
-  <div class="privacy-note">
-    Session summaries and project recaps are generated by a local
-    <code>claude -p</code> call, which sends that session's transcript to
-    your configured Claude model to produce the summary text — this is the
-    only network activity anywhere in this pipeline.{exclusion_note}
-  </div>
-
-  <div class="overview" id="overview"></div>
+  <details class="how-summaries-work">
+    <summary>How summaries work</summary>
+    <p>
+      Dashboard data (this page, and the session records behind it) is stored
+      locally on this machine. Producing a session summary or project recap
+      runs a local <code>claude -p</code> call, which may send that session's
+      transcript content to your configured Claude model — this is the only
+      network activity anywhere in this pipeline.{exclusion_note}
+    </p>
+  </details>
 
   <div class="controls">
-    <input type="text" id="search" placeholder="Search project, summary, next action...">
+    <input type="text" id="search" placeholder="Search project name or path...">
     <button class="clear-filters" id="clearFilters" hidden>Clear filters</button>
   </div>
 
@@ -1191,9 +1262,9 @@ SESSIONS.forEach((s, i) => {{ s.idx = i; }});
 const PROJECT_RECAPS = {recaps_json};
 
 const SOURCE_LABEL = {{"session_end": "session end", "recap_reconciliation": "recap check", "legacy_md": "earlier log"}};
+const GENERATED_AT = "{generated_at}";
 
 let searchQuery = "";
-let overviewFilter = null; // null | "Completed" | "Unfinished" | "Blocked"
 let currentView = "grid";  // "grid" | "detail"
 let currentProject = null;
 const expandedCards = new Set();
@@ -1342,8 +1413,8 @@ function buildCard(s, opts) {{
   if (opts.showProject) {{
     meta.appendChild(el("span", {{className: "project-chip", text: s.project}}));
   }}
-  const when = el("span", {{text: formatFriendlyDate(s.ended_at)}});
-  when.title = s.ended_at;
+  const when = el("span", {{text: s.last_activity_valid ? formatFriendlyDate(s.ended_at) : "Date unavailable"}});
+  if (s.last_activity_valid) when.title = s.ended_at;
   meta.appendChild(when);
   card.appendChild(meta);
 
@@ -1373,6 +1444,11 @@ function buildCard(s, opts) {{
     const copyBtn = el("button", {{className: "btn btn-primary", text: "Copy resume command"}});
     copyBtn.addEventListener("click", () => copyToClipboard(copyBtn, s.resume_command, "Copied — paste into Terminal."));
     actions.appendChild(copyBtn);
+  }} else {{
+    const disabledBtn = el("button", {{className: "btn btn-primary", text: "Copy resume command"}});
+    disabledBtn.disabled = true;
+    disabledBtn.title = s.resume_unavailable_reason || "unavailable";
+    actions.appendChild(disabledBtn);
   }}
   if (s.force_command) {{
     const forceBtn = el("button", {{className: "btn btn-secondary", text: "Copy summarize-now command"}});
@@ -1409,7 +1485,9 @@ function buildCard(s, opts) {{
     resumeField.appendChild(el("code", {{className: "resume", text: s.resume_command}}));
     details.appendChild(resumeField);
   }} else {{
-    details.appendChild(el("div", {{className: "no-resume", text: "No resume command available for this entry."}}));
+    const reason = s.resume_unavailable_reason || "unavailable";
+    details.appendChild(el("div", {{className: "no-resume",
+      text: `Resume command unavailable — ${{reason}}.`}}));
   }}
   card.appendChild(details);
 
@@ -1429,51 +1507,34 @@ function buildCard(s, opts) {{
   return card;
 }}
 
-function renderOverview() {{
-  const completedCount = SESSIONS.filter(s => s.status === "Completed").length;
-  const unfinishedCount = SESSIONS.filter(s => s.status === "In Progress" || s.status === "Unknown").length;
-  const blockedCount = SESSIONS.filter(s => s.status === "Blocked").length;
-  const attentionProjects = new Set(SESSIONS.filter(s => s.status !== "Completed").map(s => s.project));
-
-  const stats = [
-    {{label: "Needs attention", num: attentionProjects.size, value: null}},
-    {{label: "Completed", num: completedCount, value: "Completed"}},
-    {{label: "Unfinished", num: unfinishedCount, value: "Unfinished"}},
-    {{label: "Blocked", num: blockedCount, value: "Blocked"}},
-  ];
-
-  const overview = document.getElementById("overview");
-  overview.innerHTML = "";
-  for (const stat of stats) {{
-    const btn = el("button", {{className: "stat"}});
-    btn.type = "button";
-    btn.setAttribute("aria-pressed", String(overviewFilter === stat.value));
-    btn.appendChild(el("span", {{className: "num", text: String(stat.num)}}));
-    btn.appendChild(el("span", {{className: "label", text: stat.label}}));
-    btn.addEventListener("click", () => {{
-      overviewFilter = (overviewFilter === stat.value) ? null : stat.value;
-      render();
-    }});
-    overview.appendChild(btn);
-  }}
-}}
-
-function matchesOverviewFilter(s) {{
-  if (overviewFilter === null) return true;
-  if (overviewFilter === "Unfinished") return s.status === "In Progress" || s.status === "Unknown";
-  return s.status === overviewFilter;
+function renderHeaderStats() {{
+  const projectCount = getProjectGroups().size;
+  const sessionCount = SESSIONS.length;
+  const projectWord = projectCount === 1 ? "project" : "projects";
+  const sessionWord = sessionCount === 1 ? "session" : "sessions";
+  document.getElementById("header-stats").textContent =
+    `${{projectCount}} ${{projectWord}} · ${{sessionCount}} ${{sessionWord}} · updated ${{GENERATED_AT}}`;
 }}
 
 function matchesSearch(s) {{
   if (!searchQuery) return true;
-  const haystack = (s.project + " " + s.title + " " + s.summary + " " + s.worked_on + " " +
-    (s.next_action_required || "")).toLowerCase();
+  const haystack = (s.project + " " + (s.cwd || "") + " " + s.title + " " + s.summary + " " +
+    s.worked_on + " " + (s.next_action_required || "")).toLowerCase();
   return haystack.includes(searchQuery);
 }}
 
 function renderClearFilters() {{
   const btn = document.getElementById("clearFilters");
-  btn.hidden = !(searchQuery || overviewFilter !== null);
+  btn.hidden = !searchQuery;
+}}
+
+function latestValidEndedAt(sessions) {{
+  // Sessions within a group are already ordered newest-first by ended_at
+  // (getProjectGroups), and the epoch fallback ("1970-01-01T00:00:00Z")
+  // always string-sorts behind any real timestamp, so the first VALID
+  // session in that order is also the most recent valid one.
+  const valid = sessions.find(s => s.last_activity_valid);
+  return valid ? valid.ended_at : null;
 }}
 
 function renderProjectGrid(filtered) {{
@@ -1484,7 +1545,18 @@ function renderProjectGrid(filtered) {{
   const groups = getProjectGroups();
   const projectNames = [...groups.keys()]
     .filter(p => matchedProjects.has(p))
-    .sort((a, b) => groups.get(b)[0].ended_at.localeCompare(groups.get(a)[0].ended_at));
+    .sort((a, b) => {{
+      const keyA = latestValidEndedAt(groups.get(a));
+      const keyB = latestValidEndedAt(groups.get(b));
+      // Projects with no genuinely-dated session ever sort after every
+      // project that has one — never intermixed, never treated as "most
+      // recent" just because a fallback string happened to compare a
+      // certain way.
+      if (keyA === null && keyB === null) return 0;
+      if (keyA === null) return 1;
+      if (keyB === null) return -1;
+      return keyB.localeCompare(keyA);
+    }});
 
   if (projectNames.length === 0) return 0;
 
@@ -1498,34 +1570,34 @@ function renderProjectGrid(filtered) {{
     head.appendChild(el("div", {{className: "project-path", text: sessions[0].cwd_short}}));
     card.appendChild(head);
 
+    const latestValid = latestValidEndedAt(sessions);
+    card.appendChild(el("div", {{className: "project-card-activity",
+      text: latestValid ? formatFriendlyDate(latestValid) : "Date unavailable"}}));
+
     const recap = PROJECT_RECAPS[project];
     if (recap) {{
       card.appendChild(el("div", {{className: "project-recap", text: recap}}));
     }}
 
-    const counts = {{}};
-    for (const s of sessions) {{
-      if (s.status !== "Completed") counts[s.status] = (counts[s.status] || 0) + 1;
-    }}
-    const chipParts = ["Blocked", "In Progress", "Unknown"]
-      .filter(status => counts[status])
-      .map(status => `${{counts[status]}} ${{status.toLowerCase()}}`);
-    if (chipParts.length) {{
-      card.appendChild(el("div", {{className: "project-card-chips", text: chipParts.join(" · ")}}));
-    }}
-
     const preview = el("div", {{className: "project-preview"}});
-    for (const s of sessions.slice(0, 5)) {{
+    for (const s of sessions.slice(0, 3)) {{
       const row = el("div", {{className: "preview-row"}});
       row.appendChild(el("span", {{className: "preview-dot " + badgeClass(s.status)}}));
       row.appendChild(el("span", {{className: "preview-title", text: s.title}}));
-      row.appendChild(el("span", {{className: "preview-date", text: formatRelative(s.ended_at)}}));
+      row.appendChild(el("span", {{className: "preview-date",
+        text: s.last_activity_valid ? formatRelative(s.ended_at) : "Date unavailable"}}));
       preview.appendChild(row);
     }}
     card.appendChild(preview);
 
-    card.appendChild(el("div", {{className: "project-card-count",
-      text: sessions.length + (sessions.length === 1 ? " session" : " sessions")}}));
+    if (sessions.length > 3) {{
+      const viewAll = el("span", {{className: "view-all-row", text: `View all ${{sessions.length}} sessions`}});
+      viewAll.addEventListener("click", (e) => {{
+        e.stopPropagation();
+        location.hash = "project=" + encodeURIComponent(project);
+      }});
+      card.appendChild(viewAll);
+    }}
 
     card.addEventListener("click", () => {{
       location.hash = "project=" + encodeURIComponent(project);
@@ -1558,7 +1630,7 @@ function renderProjectDetail(filtered) {{
 function render() {{
   renderClearFilters();
 
-  const filtered = SESSIONS.filter(s => matchesOverviewFilter(s) && matchesSearch(s));
+  const filtered = SESSIONS.filter(s => matchesSearch(s));
 
   document.getElementById("view-grid").hidden = currentView !== "grid";
   document.getElementById("view-detail").hidden = currentView !== "detail";
@@ -1581,7 +1653,6 @@ document.getElementById("search").addEventListener("input", (e) => {{
 }});
 document.getElementById("clearFilters").addEventListener("click", () => {{
   searchQuery = "";
-  overviewFilter = null;
   document.getElementById("search").value = "";
   render();
 }});
@@ -1593,7 +1664,7 @@ window.addEventListener("hashchange", () => {{
   render();
 }});
 
-renderOverview();
+renderHeaderStats();
 applyHashState();
 render();
 </script>
