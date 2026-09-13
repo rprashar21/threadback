@@ -25,6 +25,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORD_HELPER="$SCRIPT_DIR/../scripts/session_record.py"
+LOG_ROOT="$HOME/.claude/session-logs"
+mkdir -p "$LOG_ROOT"
+HOOK_ERROR_LOG="$LOG_ROOT/hook-errors.log"
 
 PROJECT_SLUG="$(python3 "$RECORD_HELPER" slugify "$CWD" 2>/dev/null || true)"
 if [ -z "$PROJECT_SLUG" ]; then
@@ -34,12 +37,14 @@ fi
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DATA="$(python3 -c 'import json,sys; print(json.dumps({"started_at": sys.argv[1], "source": sys.argv[2], "cwd": sys.argv[3]}))' "$STARTED_AT" "$SOURCE" "$CWD")"
 
-python3 "$RECORD_HELPER" merge-section \
+if ! MERGE_ERR="$(python3 "$RECORD_HELPER" merge-section \
   --project-slug="$PROJECT_SLUG" \
   --session-id="$SESSION_ID" \
   --section="start" \
   --data="$DATA" \
   --event-ts="$STARTED_AT" \
-  >/dev/null 2>&1 || true
+  2>&1 1>/dev/null)"; then
+  printf '[%s] session-start-log.sh: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MERGE_ERR" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+fi
 
 exit 0

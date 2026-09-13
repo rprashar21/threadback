@@ -25,13 +25,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRANSCRIPT_PATH="$1"
 PROJECT_SLUG="$2"
 SESSION_ID="$3"
+LOG_ROOT="$HOME/.claude/session-logs"
+mkdir -p "$LOG_ROOT"
+HOOK_ERROR_LOG="$LOG_ROOT/hook-errors.log"
 
-python3 -c '
+# session_summarize.py already logs any claude -p failure itself
+# (summarizer-errors.log) — this only catches a failure BEFORE that, e.g. a
+# Python/import error, which used to vanish entirely.
+if ! WORKER_ERR="$(python3 -c '
 import sys
 sys.path.insert(0, sys.argv[1])
 import session_summarize as ss
 ss.run_bounded_summary(sys.argv[2], sys.argv[3], sys.argv[4], "session_end", timeout_secs=180)
 ' "$SCRIPT_DIR/../scripts" "$TRANSCRIPT_PATH" "$PROJECT_SLUG" "$SESSION_ID" \
-  >/dev/null 2>&1 || true
+  2>&1 1>/dev/null)"; then
+  printf '[%s] session-summarize-worker.sh: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WORKER_ERR" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+fi
 
 exit 0

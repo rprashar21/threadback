@@ -334,6 +334,12 @@ def collect_legacy_entries() -> tuple[dict[str, LegacyEntry], list[LegacyEntry]]
 DASHBOARD_WARNINGS_LOG = LOG_ROOT / "dashboard-warnings.log"
 KNOWN_RECORD_SECTIONS = ("start", "checkpoint", "end", "summary", "usage")
 
+# Lives alongside <session_id>.json record files in the same project
+# directory, but is a per-PROJECT cache (see _project_recap_path / one
+# call site further down), never a session record — collect_json_records
+# must not treat it as one.
+PROJECT_RECAP_FILENAME = "project_recap.json"
+
 
 def _log_dashboard_warning(message: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -369,6 +375,15 @@ def collect_json_records() -> dict[str, dict]:
     """session_id -> record dict ({"start": ..., "checkpoint": ..., "end": ...,
     "summary": ...}), scanning every ~/.claude/session-logs/<slug>/<id>.json."""
     records: dict[str, dict] = {}
+    # session_id is assumed globally unique (it mirrors a real Claude Code
+    # transcript filename, which can only ever live under one project
+    # directory) — every downstream structure (this dict, `combined` in
+    # build_combined, `SESSIONS` in the dashboard) is keyed on that
+    # assumption. If it's ever violated (duplicated/copied record files, a
+    # bug elsewhere), silently letting the last one found overwrite the
+    # first would make a whole session vanish with zero trace. Track where
+    # each session_id was first seen so a collision can be logged instead.
+    first_seen: dict[str, Path] = {}
     if not LOG_ROOT.is_dir():
         return records
     for project_dir in sorted(LOG_ROOT.iterdir()):
@@ -377,6 +392,19 @@ def collect_json_records() -> dict[str, dict]:
         if _is_excluded_slug(project_dir.name):
             continue
         for json_file in sorted(project_dir.glob("*.json")):
+            # Only <session_id>.json files are session records. A project
+            # directory also holds project_recap.json (a per-PROJECT cache,
+            # not a session — see _project_recap_path/PROJECT_RECAP_FILENAME
+            # below) and dot-prefixed atomic-write temp files (merge_section
+            # and _write_project_recap both write via a `.{...}.tmp-<pid>.json`
+            # + rename). Both used to be silently ingested here as if they
+            # were session records — project_recap.json in particular has no
+            # "session_id" of its own, so json_file.stem ("project_recap")
+            # collided identically across every project, one phantom
+            # "(unknown project)" session actually being one project's
+            # cached recap text mistaken for a session summary.
+            if json_file.name.startswith(".") or json_file.name == PROJECT_RECAP_FILENAME:
+                continue
             session_id = json_file.stem
             try:
                 raw = json.loads(json_file.read_text())
@@ -384,8 +412,18 @@ def collect_json_records() -> dict[str, dict]:
                 _log_dashboard_warning(f"{json_file}: unreadable/invalid JSON ({e}) — skipped")
                 continue
             sanitized = _sanitize_record(raw, str(json_file))
-            if sanitized is not None:
-                records[session_id] = sanitized
+            if sanitized is None:
+                continue
+            if session_id in records:
+                _log_dashboard_warning(
+                    f"session_id {session_id!r} found under two different project "
+                    f"directories ({first_seen[session_id]} and {json_file}) — "
+                    "keeping the first, ignoring the second. session_id is assumed "
+                    "globally unique; this suggests a duplicated/copied record file."
+                )
+                continue
+            records[session_id] = sanitized
+            first_seen[session_id] = json_file
     return records
 
 
@@ -960,7 +998,7 @@ PROJECT_RECAP_CAP = 3              # max project recaps (re)generated per /recap
 
 
 def _project_recap_path(slug: str) -> Path:
-    return LOG_ROOT / slug / "project_recap.json"
+    return LOG_ROOT / slug / PROJECT_RECAP_FILENAME
 
 
 def _read_project_recap(slug: str) -> dict | None:

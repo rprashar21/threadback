@@ -42,6 +42,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_ROOT="$HOME/.claude/session-logs"
 mkdir -p "$LOG_ROOT"
+HOOK_ERROR_LOG="$LOG_ROOT/hook-errors.log"
 
 PAYLOAD="$(cat)"
 
@@ -59,9 +60,12 @@ if [ "$TRANSCRIPT_SIZE" -lt 1024 ]; then
   exit 0
 fi
 
-if [ -z "$CWD" ]; then
-  CWD="$(pwd)"
-fi
+# No guessing: an explicit empty-string cwd in the payload used to be
+# silently replaced with this hook's OWN pwd, which has no relation to the
+# actual session and could mis-attribute the record to the wrong project.
+# Downstream already handles an empty CWD safely — slugify_cwd("") produces
+# an empty slug, and the check right below exits cleanly — so a real
+# "cwd unknown" case is now skipped instead of guessed.
 
 # session_id is just the transcript's filename (without extension) — that's
 # how Claude Code names transcript files under ~/.claude/projects/<slug>/.
@@ -78,13 +82,19 @@ ENDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Fast, deterministic fact — not a status guess. Written synchronously so it
 # survives even if the worker below never completes.
 END_DATA="$(python3 -c 'import json,sys; print(json.dumps({"ended_at": sys.argv[1], "reason": sys.argv[2], "cwd": sys.argv[3]}))' "$ENDED_AT" "$REASON" "$CWD")"
-python3 "$RECORD_HELPER" merge-section \
+# A failure here used to vanish entirely (>/dev/null 2>&1 || true swallowed
+# everything, including e.g. a rejected invalid session_id). Capture stderr
+# only on failure — the common/success path stays exactly as cheap as
+# before, no extra subshell or pipe on the hot path.
+if ! MERGE_ERR="$(python3 "$RECORD_HELPER" merge-section \
   --project-slug="$PROJECT_SLUG" \
   --session-id="$SESSION_ID" \
   --section="end" \
   --data="$END_DATA" \
   --event-ts="$ENDED_AT" \
-  >/dev/null 2>&1 || true
+  2>&1 1>/dev/null)"; then
+  printf '[%s] session-end-log.sh: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MERGE_ERR" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+fi
 
 # Hand the slow part off to a fully detached worker (new process
 # session/group via start_new_session) so it survives this hook being

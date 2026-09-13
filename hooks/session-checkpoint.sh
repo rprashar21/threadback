@@ -26,6 +26,9 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORD_HELPER="$SCRIPT_DIR/../scripts/session_record.py"
+LOG_ROOT="$HOME/.claude/session-logs"
+mkdir -p "$LOG_ROOT"
+HOOK_ERROR_LOG="$LOG_ROOT/hook-errors.log"
 PROJECT_SLUG="$(python3 "$RECORD_HELPER" slugify "$CWD" 2>/dev/null || true)"
 if [ -z "$PROJECT_SLUG" ]; then
   exit 0
@@ -38,12 +41,14 @@ TRANSCRIPT_MTIME="$(python3 -c 'import datetime,sys; print(datetime.datetime.utc
 
 DATA="$(python3 -c 'import json,sys; print(json.dumps({"checked_at": sys.argv[1], "transcript_bytes": int(sys.argv[2]), "transcript_mtime": sys.argv[3]}))' "$CHECKED_AT" "$TRANSCRIPT_BYTES" "$TRANSCRIPT_MTIME")"
 
-python3 "$RECORD_HELPER" merge-section \
+if ! MERGE_ERR="$(python3 "$RECORD_HELPER" merge-section \
   --project-slug="$PROJECT_SLUG" \
   --session-id="$SESSION_ID" \
   --section="checkpoint" \
   --data="$DATA" \
   --event-ts="$CHECKED_AT" \
-  >/dev/null 2>&1 || true
+  2>&1 1>/dev/null)"; then
+  printf '[%s] session-checkpoint.sh: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$MERGE_ERR" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+fi
 
 exit 0
