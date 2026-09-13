@@ -187,6 +187,16 @@ def _is_plausible_ts(iso: str | None) -> bool:
     return True
 
 
+def _as_text(value: object, fallback: str) -> str:
+    """A summary-section field is supposed to be a string, but a
+    hand-edited or corrupted record could hold anything JSON allows. Never
+    let a wrong-typed value (a list, a dict, a number) reach code that
+    assumes .strip()/.split() work on it."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return fallback
+
+
 # --- Legacy .md parsing (unchanged parsing rules, kept for history) --------
 
 @dataclass
@@ -321,6 +331,40 @@ def collect_legacy_entries() -> tuple[dict[str, LegacyEntry], list[LegacyEntry]]
 
 # --- JSON record collection -------------------------------------------------
 
+DASHBOARD_WARNINGS_LOG = LOG_ROOT / "dashboard-warnings.log"
+KNOWN_RECORD_SECTIONS = ("start", "checkpoint", "end", "summary", "usage")
+
+
+def _log_dashboard_warning(message: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        DASHBOARD_WARNINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with DASHBOARD_WARNINGS_LOG.open("a") as f:
+            f.write(f"[{ts}] {message}\n")
+    except OSError:
+        pass
+
+
+def _sanitize_record(raw: object, source: str) -> dict | None:
+    """A record file is only ever produced by session_record.py's own
+    merge_section, which always writes a top-level dict of dict-valued
+    sections — but a hand-edited, partially-written, or otherwise corrupted
+    file could violate that. One such file must never take down dashboard
+    generation for every other session/project, so this validates the shape
+    and drops (with a logged warning, not silently) whatever doesn't hold:
+    a non-dict top level, or a section whose value isn't itself a dict."""
+    if not isinstance(raw, dict):
+        _log_dashboard_warning(f"{source}: record is not a JSON object (got {type(raw).__name__}) — skipped")
+        return None
+    sanitized: dict = {}
+    for key, value in raw.items():
+        if key in KNOWN_RECORD_SECTIONS and not isinstance(value, dict):
+            _log_dashboard_warning(f"{source}: section {key!r} is not an object (got {type(value).__name__}) — dropped")
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
 def collect_json_records() -> dict[str, dict]:
     """session_id -> record dict ({"start": ..., "checkpoint": ..., "end": ...,
     "summary": ...}), scanning every ~/.claude/session-logs/<slug>/<id>.json."""
@@ -335,9 +379,13 @@ def collect_json_records() -> dict[str, dict]:
         for json_file in sorted(project_dir.glob("*.json")):
             session_id = json_file.stem
             try:
-                records[session_id] = json.loads(json_file.read_text())
-            except (OSError, json.JSONDecodeError):
+                raw = json.loads(json_file.read_text())
+            except (OSError, json.JSONDecodeError) as e:
+                _log_dashboard_warning(f"{json_file}: unreadable/invalid JSON ({e}) — skipped")
                 continue
+            sanitized = _sanitize_record(raw, str(json_file))
+            if sanitized is not None:
+                records[session_id] = sanitized
     return records
 
 
@@ -707,14 +755,30 @@ def _strip_markdown_inline(text: str) -> str:
     return text.strip()
 
 
+# A title/summary only ever needs a short excerpt (make_title further caps
+# it to 10 words), so the sentence-boundary regex below is only ever run
+# against a bounded prefix. Without this, a very long, punctuation-free
+# field (a corrupted or adversarial `worked_on` value) makes
+# `(.+?[.!?])(\s|$)` quadratic — re.search has to fail at every start
+# position, each attempt itself scanning to the end — measured ~25x slower
+# for 5x more input, hanging indefinitely on a multi-MB field.
+FIRST_SENTENCE_SCAN_LIMIT = 500
+
+
 def _first_sentence(text: str) -> str:
     text = text.strip()
     if not text:
         return ""
     first_line = text.splitlines()[0].strip()
-    first_line = _strip_markdown_inline(first_line)
+    was_truncated = len(first_line) > FIRST_SENTENCE_SCAN_LIMIT
+    first_line = _strip_markdown_inline(first_line[:FIRST_SENTENCE_SCAN_LIMIT])
     m = re.search(r"(.+?[.!?])(\s|$)", first_line)
-    sentence = m.group(1) if m else first_line
+    if m:
+        sentence = m.group(1)
+    elif was_truncated:
+        sentence = first_line + "…"
+    else:
+        sentence = first_line
     return sentence.strip()
 
 
@@ -812,11 +876,18 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
         last_active_iso = _iso(last_active) if last_active else "1970-01-01T00:00:00Z"
 
         if summary_section:
-            status = summary_section["status"] if summary_section["status"] in VALID_STATUSES else "Unknown"
-            worked_on = summary_section["worked_on"]
-            completed = summary_section["completed"]
-            stopped_at = summary_section["stopped_at"]
-            next_action_text = summary_section["next_action"]
+            # .get() with the same fallbacks parse_summary_body() itself uses
+            # (session_summarize.py) — a hand-edited or partially-written
+            # summary section missing a key, or one with a wrong-typed value
+            # (e.g. a list where a string is expected), must degrade
+            # gracefully, not take down the whole dashboard with a KeyError
+            # or AttributeError deeper in make_summary/make_title.
+            status = summary_section.get("status")
+            status = status if status in VALID_STATUSES else "Unknown"
+            worked_on = _as_text(summary_section.get("worked_on"), "Nothing notable.")
+            completed = _as_text(summary_section.get("completed"), "Nothing notable.")
+            stopped_at = _as_text(summary_section.get("stopped_at"), "Nothing notable.")
+            next_action_text = _as_text(summary_section.get("next_action"), "")
             summary_source = summary_section.get("summary_source")
             summary_at = summary_section.get("summary_at")
             summary = make_summary(worked_on, completed)

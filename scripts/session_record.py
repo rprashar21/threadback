@@ -58,7 +58,32 @@ def slugify_cwd(cwd: str) -> str:
     return _NON_ALNUM_RE.sub("-", cwd)
 
 
+# record_path() joins these two values straight into a filesystem path.
+# slugify_cwd() already guarantees project_slug never contains anything but
+# alphanumerics/hyphens, but session_id reaches merge_section() straight from
+# each hook's own untrusted stdin JSON payload (session-start-log.sh,
+# session-checkpoint.sh) with no sanitization before this point — a
+# session_id of "../../../etc/pwned" or "/tmp/absolute-poc" reaches
+# `LOG_ROOT / project_slug / f"{session_id}.json"` and Path's own join
+# semantics either escape LOG_ROOT entirely (relative traversal) or discard
+# it altogether (an absolute-looking component replaces the whole path) —
+# both reproduced directly against this function. Every path component this
+# module builds a Path from is validated against this rule first.
+_SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_path_component(value: str, label: str) -> str:
+    if not value or not _SAFE_PATH_COMPONENT_RE.fullmatch(value):
+        raise ValueError(
+            f"invalid {label}: {value!r} — must be a single non-empty path "
+            "component (letters, digits, '_', '-' only; no '/', '.', or empty string)"
+        )
+    return value
+
+
 def record_path(project_slug: str, session_id: str) -> Path:
+    project_slug = _validate_path_component(project_slug, "project_slug")
+    session_id = _validate_path_component(session_id, "session_id")
     return LOG_ROOT / project_slug / f"{session_id}.json"
 
 
@@ -151,10 +176,14 @@ def _cli() -> int:
         return 0
 
     if args.action == "merge-section":
-        data = json.loads(args.data)
-        applied = merge_section(
-            args.project_slug, args.session_id, args.section, data, args.event_ts
-        )
+        try:
+            data = json.loads(args.data)
+            applied = merge_section(
+                args.project_slug, args.session_id, args.section, data, args.event_ts
+            )
+        except ValueError as e:
+            print(f"rejected: {e}", file=sys.stderr)
+            return 1
         print("applied" if applied else "rejected-stale")
         return 0
 
