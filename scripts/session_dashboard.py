@@ -278,8 +278,28 @@ class Combined:
     is_orphan: bool = False
 
 
+def build_transcript_index() -> dict[str, tuple[str, Path]]:
+    """session_id -> (project_slug, transcript_path), scanning every real
+    transcript under ~/.claude/projects/ once. This is the one place project
+    identity is looked up from — a session's OWN record may not carry a cwd
+    (e.g. a summary-only record for a session that predates the
+    SessionStart/Stop hooks, or one recovered by reconciliation), but its
+    transcript's location on disk is always authoritative."""
+    index: dict[str, tuple[str, Path]] = {}
+    if not PROJECTS_ROOT.is_dir():
+        return index
+    for project_dir in sorted(PROJECTS_ROOT.iterdir()):
+        if not project_dir.is_dir() or project_dir.name == SUMMARIZER_SCRATCH_SLUG:
+            continue
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            index[jsonl_file.stem] = (project_dir.name, jsonl_file)
+    return index
+
+
 def build_combined(
-    legacy_by_id: dict[str, LegacyEntry], json_records: dict[str, dict]
+    legacy_by_id: dict[str, LegacyEntry],
+    json_records: dict[str, dict],
+    transcript_index: dict[str, tuple[str, Path]],
 ) -> dict[str, Combined]:
     combined: dict[str, Combined] = {}
 
@@ -298,55 +318,61 @@ def build_combined(
         else:
             combined[sid] = Combined(session_id=sid, cwd=cwd, record=record)
 
-    # Resolve each entry's real transcript path via the canonical slug
-    # (derived from its known cwd), so staleness/liveness checks and lazy
-    # summarization always look at the actual current transcript, no matter
-    # which (possibly legacy-named) directory its log file lives in.
+    # Resolve each entry's real transcript path directly from the index —
+    # authoritative regardless of whether the record itself carries a cwd
+    # (a record made only of a "summary" section, e.g. one written by lazy
+    # summarization for a session that had no cwd on disk yet, carries no
+    # cwd at all — looking it up via slugify_cwd(cwd) would silently fail
+    # forever in that case).
     for c in combined.values():
-        if c.cwd:
-            slug = sr.slugify_cwd(c.cwd)
-            candidate = PROJECTS_ROOT / slug / f"{c.session_id}.jsonl"
-            if candidate.is_file():
-                c.transcript_path = candidate
+        entry = transcript_index.get(c.session_id) if c.session_id else None
+        if entry:
+            _, path = entry
+            c.transcript_path = path
+
+    # Recover a still-missing cwd from another session in the same project
+    # that does have one recorded — keyed by the transcript's real parent
+    # directory (ground truth), not a guessed/reversed slug. Without this,
+    # a session summarized before it had a known cwd (or one whose only
+    # record section is "summary") would permanently drop out of its
+    # project's grouping on every subsequent run.
+    slug_to_cwd: dict[str, str] = {}
+    for c in combined.values():
+        if c.cwd and c.transcript_path is not None:
+            slug_to_cwd.setdefault(c.transcript_path.parent.name, c.cwd)
+    for c in combined.values():
+        if not c.cwd and c.transcript_path is not None:
+            c.cwd = slug_to_cwd.get(c.transcript_path.parent.name)
 
     return combined
 
 
-def reconcile_orphans(combined: dict[str, Combined]) -> None:
+def reconcile_orphans(combined: dict[str, Combined], transcript_index: dict[str, tuple[str, Path]]) -> None:
     """Any real transcript with no record/legacy entry at all — e.g. the
     session crashed before any hook could run — gets a synthesized entry
     instead of silently vanishing from the dashboard."""
-    if not PROJECTS_ROOT.is_dir():
-        return
-
     slug_to_cwd: dict[str, str] = {}
     for c in combined.values():
-        if c.cwd:
-            slug_to_cwd[sr.slugify_cwd(c.cwd)] = c.cwd
+        if c.cwd and c.transcript_path is not None:
+            slug_to_cwd.setdefault(c.transcript_path.parent.name, c.cwd)
 
     cutoff = _now() - timedelta(days=ORPHAN_RECONCILE_MAX_AGE_DAYS)
 
-    for project_dir in sorted(PROJECTS_ROOT.iterdir()):
-        if not project_dir.is_dir() or project_dir.name == SUMMARIZER_SCRATCH_SLUG:
+    for sid, (slug, jsonl_file) in transcript_index.items():
+        if sid in combined:
             continue
-        slug = project_dir.name
-        for jsonl_file in sorted(project_dir.glob("*.jsonl")):
-            sid = jsonl_file.stem
-            if sid in combined:
-                continue
-            try:
-                mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime, tz=timezone.utc)
-            except OSError:
-                continue
-            if mtime < cutoff:
-                continue
-            cwd = slug_to_cwd.get(slug)
-            combined[sid] = Combined(
-                session_id=sid,
-                cwd=cwd,
-                transcript_path=jsonl_file,
-                is_orphan=True,
-            )
+        try:
+            mtime = datetime.fromtimestamp(jsonl_file.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        combined[sid] = Combined(
+            session_id=sid,
+            cwd=slug_to_cwd.get(slug),
+            transcript_path=jsonl_file,
+            is_orphan=True,
+        )
 
 
 # --- Staleness / liveness / lazy summarization ------------------------------
@@ -726,15 +752,32 @@ def render_html(data: list[dict]) -> str:
   section.session-section {{ margin-bottom: 32px; }}
   section.session-section > h2 {{ font-size: 1.05rem; font-weight: 700; margin: 0 0 12px; }}
 
-  .project-group {{ margin-bottom: 22px; }}
-  .project-head {{ display: flex; align-items: baseline; gap: 8px; width: 100%; background: none; border: none;
-           padding: 0 0 6px; margin-bottom: 10px; border-bottom: 2px solid var(--border); cursor: pointer;
-           font: inherit; color: var(--fg); text-align: left; }}
-  .project-head .chevron {{ font-size: 0.75rem; color: var(--muted); transition: transform 0.15s ease; }}
-  .project-head[aria-expanded="false"] .chevron {{ transform: rotate(-90deg); }}
-  .project-head-text {{ display: flex; flex-direction: column; gap: 1px; }}
   .project-name {{ font-size: 1.05rem; font-weight: 700; }}
   .project-path {{ font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+
+  /* --- project grid (home view) --- */
+  .project-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }}
+  .project-card {{ display: block; width: 100%; text-align: left; background: var(--card-bg);
+           border: 1px solid var(--border); border-radius: 12px; padding: 16px; cursor: pointer;
+           font: inherit; color: var(--fg); }}
+  .project-card:hover {{ border-color: var(--accent); }}
+  .project-card-head {{ margin-bottom: 8px; }}
+  .project-card-chips {{ font-size: 0.76rem; color: var(--unknown); font-weight: 600; margin-bottom: 10px; }}
+  .project-preview {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }}
+  .preview-row {{ display: flex; align-items: center; gap: 7px; font-size: 0.82rem; }}
+  .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; }}
+  .preview-dot.completed {{ background: var(--completed); }}
+  .preview-dot.in-progress {{ background: var(--in-progress); }}
+  .preview-dot.blocked {{ background: var(--blocked); }}
+  .preview-dot.unknown {{ background: var(--unknown); }}
+  .preview-title {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .preview-date {{ color: var(--muted); font-size: 0.74rem; white-space: nowrap; }}
+  .project-card-count {{ font-size: 0.74rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; }}
+
+  /* --- project detail view --- */
+  .back-link {{ background: none; border: none; color: var(--accent); cursor: pointer; font: inherit;
+           font-size: 0.85rem; padding: 6px 0; margin-bottom: 8px; text-decoration: underline; }}
+  .detail-header {{ margin-bottom: 18px; padding-bottom: 12px; border-bottom: 2px solid var(--border); }}
 
   .card {{ background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid var(--unknown);
            border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }}
@@ -786,10 +829,6 @@ def render_html(data: list[dict]) -> str:
 
   button:focus-visible, input:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
 
-  @media (prefers-reduced-motion: reduce) {{
-    .project-head .chevron {{ transition: none; }}
-  }}
-
   @media (max-width: 480px) {{
     .overview {{ display: grid; grid-template-columns: 1fr 1fr; }}
     button.stat {{ flex: none; }}
@@ -812,14 +851,17 @@ def render_html(data: list[dict]) -> str:
     <button class="clear-filters" id="clearFilters" hidden>Clear filters</button>
   </div>
 
-  <section class="session-section" id="attention-section" hidden>
-    <h2>Needs your attention</h2>
-    <div id="attention-results"></div>
+  <section id="view-grid">
+    <div class="project-grid" id="project-grid"></div>
   </section>
 
-  <section class="session-section" id="completed-section" hidden>
-    <h2>Recent completed work</h2>
-    <div id="completed-results"></div>
+  <section id="view-detail" hidden>
+    <button type="button" class="back-link" id="backToGrid">← All projects</button>
+    <div class="detail-header">
+      <div class="project-name" id="detail-project-name"></div>
+      <div class="project-path" id="detail-project-path"></div>
+    </div>
+    <div id="detail-results"></div>
   </section>
 
   <div class="empty" id="empty-state" hidden></div>
@@ -830,12 +872,41 @@ const SESSIONS = {data_json};
 SESSIONS.forEach((s, i) => {{ s.idx = i; }});
 
 const STATUS_PRIORITY = {{"Blocked": 0, "In Progress": 1, "Unknown": 2}};
+// Same as STATUS_PRIORITY but used inside a single project's detail view,
+// where Completed sessions should sort after everything needing attention
+// rather than being excluded into a separate section.
+const DETAIL_STATUS_PRIORITY = {{"Blocked": 0, "In Progress": 1, "Unknown": 2, "Completed": 3}};
 const SOURCE_LABEL = {{"session_end": "session end", "recap_reconciliation": "recap check", "legacy_md": "earlier log"}};
 
 let searchQuery = "";
 let overviewFilter = null; // null | "Completed" | "Unfinished" | "Blocked"
-const collapsedProjects = new Set();
+let currentView = "grid";  // "grid" | "detail"
+let currentProject = null;
 const expandedCards = new Set();
+
+function getProjectGroups() {{
+  const map = new Map();
+  for (const s of SESSIONS) {{
+    if (!map.has(s.project)) map.set(s.project, []);
+    map.get(s.project).push(s);
+  }}
+  for (const sessions of map.values()) {{
+    sessions.sort((a, b) => b.ended_at.localeCompare(a.ended_at));
+  }}
+  return map;
+}}
+
+function applyHashState() {{
+  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const project = params.get("project");
+  if (project && SESSIONS.some(s => s.project === project)) {{
+    currentView = "detail";
+    currentProject = project;
+  }} else {{
+    currentView = "grid";
+    currentProject = null;
+  }}
+}}
 
 function el(tag, opts) {{
   const e = document.createElement(tag);
@@ -1077,83 +1148,83 @@ function renderClearFilters() {{
   btn.hidden = !(searchQuery || overviewFilter !== null);
 }}
 
-function renderAttentionSection(filtered) {{
-  const section = document.getElementById("attention-section");
-  const results = document.getElementById("attention-results");
+function renderProjectGrid(filtered) {{
+  const grid = document.getElementById("project-grid");
+  grid.innerHTML = "";
+
+  const matchedProjects = new Set(filtered.map(s => s.project));
+  const groups = getProjectGroups();
+  const projectNames = [...groups.keys()]
+    .filter(p => matchedProjects.has(p))
+    .sort((a, b) => groups.get(b)[0].ended_at.localeCompare(groups.get(a)[0].ended_at));
+
+  if (projectNames.length === 0) return 0;
+
+  for (const project of projectNames) {{
+    const sessions = groups.get(project);
+    const card = el("button", {{className: "project-card"}});
+    card.type = "button";
+
+    const head = el("div", {{className: "project-card-head"}});
+    head.appendChild(el("div", {{className: "project-name", text: project}}));
+    head.appendChild(el("div", {{className: "project-path", text: sessions[0].cwd_short}}));
+    card.appendChild(head);
+
+    const counts = {{}};
+    for (const s of sessions) {{
+      if (s.status !== "Completed") counts[s.status] = (counts[s.status] || 0) + 1;
+    }}
+    const chipParts = ["Blocked", "In Progress", "Unknown"]
+      .filter(status => counts[status])
+      .map(status => `${{counts[status]}} ${{status.toLowerCase()}}`);
+    if (chipParts.length) {{
+      card.appendChild(el("div", {{className: "project-card-chips", text: chipParts.join(" · ")}}));
+    }}
+
+    const preview = el("div", {{className: "project-preview"}});
+    for (const s of sessions.slice(0, 5)) {{
+      const row = el("div", {{className: "preview-row"}});
+      row.appendChild(el("span", {{className: "preview-dot " + badgeClass(s.status)}}));
+      row.appendChild(el("span", {{className: "preview-title", text: s.title}}));
+      row.appendChild(el("span", {{className: "preview-date", text: formatRelative(s.ended_at)}}));
+      preview.appendChild(row);
+    }}
+    card.appendChild(preview);
+
+    card.appendChild(el("div", {{className: "project-card-count",
+      text: sessions.length + (sessions.length === 1 ? " session" : " sessions")}}));
+
+    card.addEventListener("click", () => {{
+      location.hash = "project=" + encodeURIComponent(project);
+    }});
+
+    grid.appendChild(card);
+  }}
+  return projectNames.length;
+}}
+
+function renderProjectDetail(filtered) {{
+  const results = document.getElementById("detail-results");
   results.innerHTML = "";
 
-  const list = filtered
-    .filter(s => s.status !== "Completed")
+  const groups = getProjectGroups();
+  const allSessions = groups.get(currentProject) || [];
+  document.getElementById("detail-project-name").textContent = currentProject || "";
+  document.getElementById("detail-project-path").textContent = allSessions[0] ? allSessions[0].cwd_short : "";
+
+  const sessions = filtered
+    .filter(s => s.project === currentProject)
     .sort((a, b) => {{
-      const pa = STATUS_PRIORITY[a.status] ?? 2;
-      const pb = STATUS_PRIORITY[b.status] ?? 2;
+      const pa = DETAIL_STATUS_PRIORITY[a.status] ?? 2;
+      const pb = DETAIL_STATUS_PRIORITY[b.status] ?? 2;
       if (pa !== pb) return pa - pb;
       return b.ended_at.localeCompare(a.ended_at);
     }});
 
-  if (list.length === 0) {{
-    section.hidden = true;
-    return 0;
+  for (const s of sessions) {{
+    results.appendChild(buildCard(s, {{showProject: false}}));
   }}
-  section.hidden = false;
-  for (const s of list) {{
-    results.appendChild(buildCard(s, {{showProject: true}}));
-  }}
-  return list.length;
-}}
-
-function renderCompletedSection(filtered) {{
-  const section = document.getElementById("completed-section");
-  const results = document.getElementById("completed-results");
-  results.innerHTML = "";
-
-  const completed = filtered
-    .filter(s => s.status === "Completed")
-    .sort((a, b) => b.ended_at.localeCompare(a.ended_at));
-
-  if (completed.length === 0) {{
-    section.hidden = true;
-    return 0;
-  }}
-  section.hidden = false;
-
-  const byProject = new Map();
-  for (const s of completed) {{
-    if (!byProject.has(s.project)) byProject.set(s.project, []);
-    byProject.get(s.project).push(s);
-  }}
-
-  for (const [project, sessions] of byProject) {{
-    const group = el("div", {{className: "project-group"}});
-    const isCollapsed = collapsedProjects.has(project);
-
-    const head = el("button", {{className: "project-head"}});
-    head.type = "button";
-    head.setAttribute("aria-expanded", String(!isCollapsed));
-    head.appendChild(el("span", {{className: "chevron", text: "▾"}}));
-    const textWrap = el("div", {{className: "project-head-text"}});
-    textWrap.appendChild(el("div", {{className: "project-name", text: project}}));
-    textWrap.appendChild(el("div", {{className: "project-path", text: sessions[0].cwd_short}}));
-    head.appendChild(textWrap);
-    group.appendChild(head);
-
-    const body = el("div", {{className: "project-body"}});
-    body.hidden = isCollapsed;
-    for (const s of sessions) {{
-      body.appendChild(buildCard(s, {{showProject: false}}));
-    }}
-    group.appendChild(body);
-
-    head.addEventListener("click", () => {{
-      const nowHidden = !body.hidden;
-      body.hidden = nowHidden;
-      head.setAttribute("aria-expanded", String(!nowHidden));
-      if (nowHidden) collapsedProjects.add(project); else collapsedProjects.delete(project);
-    }});
-
-    results.appendChild(group);
-  }}
-  return completed.length;
+  return sessions.length;
 }}
 
 function render() {{
@@ -1161,18 +1232,19 @@ function render() {{
 
   const filtered = SESSIONS.filter(s => matchesOverviewFilter(s) && matchesSearch(s));
 
-  const attentionCount = renderAttentionSection(filtered);
-  const completedCount = renderCompletedSection(filtered);
+  document.getElementById("view-grid").hidden = currentView !== "grid";
+  document.getElementById("view-detail").hidden = currentView !== "detail";
 
   const emptyState = document.getElementById("empty-state");
-  if (attentionCount === 0 && completedCount === 0) {{
-    emptyState.hidden = false;
-    emptyState.textContent = SESSIONS.length === 0
-      ? "No sessions logged yet."
-      : "No sessions match your filters.";
+  let count;
+  if (currentView === "grid") {{
+    count = renderProjectGrid(filtered);
+    emptyState.textContent = SESSIONS.length === 0 ? "No sessions logged yet." : "No projects match your filters.";
   }} else {{
-    emptyState.hidden = true;
+    count = renderProjectDetail(filtered);
+    emptyState.textContent = "No sessions match your filters in this project.";
   }}
+  emptyState.hidden = count !== 0;
 }}
 
 document.getElementById("search").addEventListener("input", (e) => {{
@@ -1185,8 +1257,16 @@ document.getElementById("clearFilters").addEventListener("click", () => {{
   document.getElementById("search").value = "";
   render();
 }});
+document.getElementById("backToGrid").addEventListener("click", () => {{
+  location.hash = "";
+}});
+window.addEventListener("hashchange", () => {{
+  applyHashState();
+  render();
+}});
 
 renderOverview();
+applyHashState();
 render();
 </script>
 </body>
@@ -1196,17 +1276,20 @@ render();
 
 def generate_dashboard(force_session_id: str | None = None) -> Path:
     legacy_by_id, legacy_no_id = collect_legacy_entries()
+    transcript_index = build_transcript_index()
     json_records = collect_json_records()
-    combined = build_combined(legacy_by_id, json_records)
-    reconcile_orphans(combined)
+    combined = build_combined(legacy_by_id, json_records, transcript_index)
+    reconcile_orphans(combined, transcript_index)
 
     run_lazy_summarization(combined, force_session_id=force_session_id)
 
     # Re-read: run_lazy_summarization wrote directly to disk via
-    # session_record.py, so reload any records it touched.
+    # session_record.py, so reload any records it touched. The transcript
+    # index itself doesn't change (no session gets a new transcript file
+    # mid-run), so it's reused as-is.
     json_records = collect_json_records()
-    combined = build_combined(legacy_by_id, json_records)
-    reconcile_orphans(combined)
+    combined = build_combined(legacy_by_id, json_records, transcript_index)
+    reconcile_orphans(combined, transcript_index)
 
     data = build_session_data(combined)
     add_legacy_no_id_entries(data, legacy_no_id)
