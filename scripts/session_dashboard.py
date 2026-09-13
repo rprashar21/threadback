@@ -850,9 +850,9 @@ def make_title(summary: str, worked_on: str, project: str) -> str:
     words = basis.split()
     if not words:
         return f"{project} session"
-    title_words = words[:10]
+    title_words = words[:16]
     title = " ".join(title_words)
-    if len(words) > 10:
+    if len(words) > 16:
         title += "…"
     return title
 
@@ -1197,7 +1197,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
 <html>
 <head>
 <meta charset="utf-8">
-<title>Claude Work Recap</title>
+<title>Threadback</title>
 <style>
   :root {{
     color-scheme: light dark;
@@ -1243,26 +1243,40 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .project-path {{ font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
 
   /* --- project grid (home view) --- */
-  .project-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }}
+  .project-grid {{ display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }}
+  @media (min-width: 760px) {{
+    .project-grid {{ grid-template-columns: repeat(2, 1fr); }}
+  }}
+  @media (min-width: 1140px) {{
+    .project-grid {{ grid-template-columns: repeat(3, 1fr); }}
+  }}
   .project-card {{ display: block; width: 100%; text-align: left; background: var(--card-bg);
            border: 1px solid var(--border); border-radius: 12px; padding: 16px; cursor: pointer;
            font: inherit; color: var(--fg); }}
   .project-card:hover {{ border-color: var(--accent); }}
   .project-card-head {{ margin-bottom: 4px; }}
   .project-card-activity {{ font-size: 0.74rem; color: var(--muted); margin-bottom: 10px; }}
-  .project-recap {{ font-size: 0.82rem; color: var(--fg); line-height: 1.4; margin-bottom: 10px; }}
+  .project-recap {{ font-size: 0.82rem; color: var(--fg); line-height: 1.4; margin-bottom: 10px;
+           display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
+           overflow: hidden; }}
+  .project-card-next {{ font-size: 0.82rem; margin-bottom: 10px; }}
+  .project-card-next .k {{ color: var(--accent); font-weight: 700; font-size: 0.72rem; text-transform: uppercase;
+           letter-spacing: 0.05em; margin-right: 6px; }}
+  .project-card-next.no-action {{ color: var(--muted); font-style: italic; }}
   .project-preview {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }}
-  .preview-row {{ display: flex; align-items: center; gap: 7px; font-size: 0.82rem; }}
-  .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; }}
+  .preview-row {{ display: flex; align-items: flex-start; gap: 7px; font-size: 0.82rem; }}
+  .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; margin-top: 3px; }}
   .preview-dot.completed {{ background: var(--completed); }}
   .preview-dot.in-progress {{ background: var(--in-progress); }}
   .preview-dot.blocked {{ background: var(--blocked); }}
   .preview-dot.unknown {{ background: var(--unknown); }}
-  .preview-title {{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-  .preview-date {{ color: var(--muted); font-size: 0.74rem; white-space: nowrap; }}
-  .view-all-row {{ display: block; background: none; border: none; color: var(--accent); font: inherit;
-           font-size: 0.78rem; text-decoration: underline; cursor: pointer; padding: 4px 0 0; text-align: left; }}
-  .project-card-count {{ font-size: 0.74rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px; }}
+  .preview-title {{ flex: 1; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
+           -webkit-box-orient: vertical; overflow: hidden; }}
+  .preview-date {{ color: var(--muted); font-size: 0.74rem; white-space: nowrap; flex-shrink: 0; }}
+  .view-all-row {{ display: block; width: 100%; appearance: none; background: none; border: none;
+           color: var(--accent); font: inherit; font-size: 0.78rem; text-decoration: underline;
+           cursor: pointer; padding: 4px 0 0; text-align: left; }}
+  .view-all-row:hover {{ color: var(--fg); }}
 
   /* --- project detail view --- */
   .back-link {{ background: none; border: none; color: var(--accent); cursor: pointer; font: inherit;
@@ -1275,8 +1289,8 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .card.in-progress {{ border-left-color: var(--in-progress); }}
   .card.blocked {{ border-left-color: var(--blocked); }}
   .card-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }}
-  .card-title {{ font-size: 0.98rem; font-weight: 700; margin: 0; overflow: hidden; text-overflow: ellipsis;
-           white-space: nowrap; }}
+  .card-title {{ font-size: 0.98rem; font-weight: 700; margin: 0; display: -webkit-box;
+           -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
   .card-meta {{ display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; color: var(--muted);
            font-size: 0.78rem; margin-bottom: 8px; }}
   .card-meta .project-chip {{ font-weight: 600; color: var(--fg); }}
@@ -1318,18 +1332,22 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .empty {{ color: var(--muted); padding: 40px 0; text-align: center; }}
   [hidden] {{ display: none !important; }}
 
+  @media (prefers-reduced-motion: reduce) {{
+    * {{ animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
+         transition-duration: 0.01ms !important; scroll-behavior: auto !important; }}
+  }}
+
   button:focus-visible, input:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
 
   @media (max-width: 480px) {{
     .card {{ padding: 12px; }}
-    .card-title {{ white-space: normal; }}
   }}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header class="page-head">
-    <h1>Claude Work Recap</h1>
+    <h1>Threadback</h1>
     <div class="subtitle" id="header-stats">Generated {generated_at}</div>
   </header>
 
@@ -1646,6 +1664,23 @@ function latestValidEndedAt(sessions) {{
   return valid ? valid.ended_at : null;
 }}
 
+function projectNextAction(sessions) {{
+  // sessions is already sorted newest-first; only real required-action text
+  // is ever considered here — optional suggestions must never be promoted.
+  const withRequired = sessions.filter(s => s.next_action_required);
+  if (withRequired.length === 0) {{
+    return {{ kind: "none", text: "No required next action" }};
+  }}
+  const distinct = new Set(withRequired.map(s => s.next_action_required.trim()));
+  if (distinct.size > 1) {{
+    return {{ kind: "multiple", text: "Multiple open threads — see sessions below." }};
+  }}
+  // All sessions that have a required action agree (or there's only one) —
+  // surface the most recent one, even if a newer session in the group has
+  // no required action of its own.
+  return {{ kind: "single", text: withRequired[0].next_action_required }};
+}}
+
 function renderProjectGrid(filtered) {{
   const grid = document.getElementById("project-grid");
   grid.innerHTML = "";
@@ -1681,12 +1716,18 @@ function renderProjectGrid(filtered) {{
 
     const latestValid = latestValidEndedAt(sessions);
     card.appendChild(el("div", {{className: "project-card-activity",
-      text: latestValid ? formatFriendlyDate(latestValid) : "Date unavailable"}}));
+      text: latestValid ? `Last used ${{formatRelative(latestValid)}}` : "Date unavailable"}}));
 
     const recap = PROJECT_RECAPS[project];
     if (recap) {{
       card.appendChild(el("div", {{className: "project-recap", text: recap}}));
     }}
+
+    const nextInfo = projectNextAction(sessions);
+    const nextLine = el("div", {{className: "project-card-next" + (nextInfo.kind === "none" ? " no-action" : "")}});
+    nextLine.appendChild(el("span", {{className: "k", text: "Next"}}));
+    nextLine.appendChild(document.createTextNode(nextInfo.text));
+    card.appendChild(nextLine);
 
     const preview = el("div", {{className: "project-preview"}});
     for (const s of sessions.slice(0, 3)) {{
@@ -1699,14 +1740,14 @@ function renderProjectGrid(filtered) {{
     }}
     card.appendChild(preview);
 
-    if (sessions.length > 3) {{
-      const viewAll = el("span", {{className: "view-all-row", text: `View all ${{sessions.length}} sessions`}});
-      viewAll.addEventListener("click", (e) => {{
-        e.stopPropagation();
-        location.hash = "project=" + encodeURIComponent(project);
-      }});
-      card.appendChild(viewAll);
-    }}
+    const viewAll = el("button", {{className: "view-all-row",
+      text: `View all ${{sessions.length}} session${{sessions.length === 1 ? "" : "s"}} →`}});
+    viewAll.type = "button";
+    viewAll.addEventListener("click", (e) => {{
+      e.stopPropagation();
+      location.hash = "project=" + encodeURIComponent(project);
+    }});
+    card.appendChild(viewAll);
 
     card.addEventListener("click", () => {{
       location.hash = "project=" + encodeURIComponent(project);
