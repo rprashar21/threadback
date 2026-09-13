@@ -1,2 +1,13 @@
 __pycache__/
 *.pyc
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# local env
+.env
+venv/
+.venv/

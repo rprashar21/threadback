@@ -31,6 +31,7 @@ import json
 import re
 import shlex
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -347,6 +348,42 @@ def build_combined(
     return combined
 
 
+def read_cwd_from_transcript(path: Path, max_lines: int = 20) -> str | None:
+    """Fallback cwd source: every real user-turn line in a transcript
+    carries its own `cwd` field, independent of whether any hook ever ran
+    for that session. Only scans the first few lines (cwd doesn't change
+    within a session) so this stays cheap even for large transcripts."""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = d.get("cwd")
+                if cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def fill_missing_cwd_from_transcripts(combined: dict[str, Combined]) -> None:
+    """Last-resort cwd recovery for sessions with no hook-written record and
+    no same-project sibling to borrow a cwd from (see the recovery pass in
+    build_combined) — e.g. a session whose hooks never fired at all. Without
+    this, such a session shows as an unnamed "(unknown project)" duplicate
+    with no resume command, even though its own transcript knows its cwd."""
+    for c in combined.values():
+        if not c.cwd and c.transcript_path is not None:
+            c.cwd = read_cwd_from_transcript(c.transcript_path)
+
+
 def reconcile_orphans(combined: dict[str, Combined], transcript_index: dict[str, tuple[str, Path]]) -> None:
     """Any real transcript with no record/legacy entry at all — e.g. the
     session crashed before any hook could run — gets a synthesized entry
@@ -467,13 +504,24 @@ def run_lazy_summarization(combined: dict[str, Combined], force_session_id: str 
         if _needs_summary(c) and not _is_live(c, now) and c.transcript_path is not None
     ]
     candidates.sort(key=lambda c: _last_activity(c) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    candidates = candidates[:LAZY_SUMMARY_CAP]
+    if not candidates:
+        return
 
-    for c in candidates[:LAZY_SUMMARY_CAP]:
+    def _summarize(c: Combined) -> None:
         slug = sr.slugify_cwd(c.cwd) if c.cwd else c.transcript_path.parent.name
         ss.run_bounded_summary(
             str(c.transcript_path), slug, c.session_id, "recap_reconciliation",
             timeout_secs=SUMMARY_TIMEOUT_SECS,
         )
+
+    # Each candidate is a separate `claude -p` subprocess targeting a
+    # different session's record file (session_record.py's per-session flock
+    # already makes concurrent writes safe), so there's no reason to
+    # serialize them — running sequentially made /recap's worst case
+    # ~LAZY_SUMMARY_CAP x SUMMARY_TIMEOUT_SECS instead of ~1x.
+    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        list(pool.map(_summarize, candidates))
 
 
 # --- Display-only derived fields --------------------------------------------
@@ -871,11 +919,6 @@ def render_html(data: list[dict]) -> str:
 const SESSIONS = {data_json};
 SESSIONS.forEach((s, i) => {{ s.idx = i; }});
 
-const STATUS_PRIORITY = {{"Blocked": 0, "In Progress": 1, "Unknown": 2}};
-// Same as STATUS_PRIORITY but used inside a single project's detail view,
-// where Completed sessions should sort after everything needing attention
-// rather than being excluded into a separate section.
-const DETAIL_STATUS_PRIORITY = {{"Blocked": 0, "In Progress": 1, "Unknown": 2, "Completed": 3}};
 const SOURCE_LABEL = {{"session_end": "session end", "recap_reconciliation": "recap check", "legacy_md": "earlier log"}};
 
 let searchQuery = "";
@@ -1214,12 +1257,7 @@ function renderProjectDetail(filtered) {{
 
   const sessions = filtered
     .filter(s => s.project === currentProject)
-    .sort((a, b) => {{
-      const pa = DETAIL_STATUS_PRIORITY[a.status] ?? 2;
-      const pb = DETAIL_STATUS_PRIORITY[b.status] ?? 2;
-      if (pa !== pb) return pa - pb;
-      return b.ended_at.localeCompare(a.ended_at);
-    }});
+    .sort((a, b) => b.ended_at.localeCompare(a.ended_at));
 
   for (const s of sessions) {{
     results.appendChild(buildCard(s, {{showProject: false}}));
@@ -1280,6 +1318,7 @@ def generate_dashboard(force_session_id: str | None = None) -> Path:
     json_records = collect_json_records()
     combined = build_combined(legacy_by_id, json_records, transcript_index)
     reconcile_orphans(combined, transcript_index)
+    fill_missing_cwd_from_transcripts(combined)
 
     run_lazy_summarization(combined, force_session_id=force_session_id)
 
@@ -1290,6 +1329,7 @@ def generate_dashboard(force_session_id: str | None = None) -> Path:
     json_records = collect_json_records()
     combined = build_combined(legacy_by_id, json_records, transcript_index)
     reconcile_orphans(combined, transcript_index)
+    fill_missing_cwd_from_transcripts(combined)
 
     data = build_session_data(combined)
     add_legacy_no_id_entries(data, legacy_no_id)
