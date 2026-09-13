@@ -28,6 +28,7 @@ session's summary immediately, bypassing the per-run cap.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import sys
@@ -43,6 +44,7 @@ import session_summarize as ss  # noqa: E402
 LOG_ROOT = Path.home() / ".claude" / "session-logs"
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 OUT_FILE = LOG_ROOT / "dashboard.html"
+SELF_PATH = Path(__file__).resolve()
 
 # session_summarize.py always runs its `claude -p` subprocess from this
 # dedicated scratch directory (never a real project) precisely so its own
@@ -51,6 +53,36 @@ OUT_FILE = LOG_ROOT / "dashboard.html"
 # and get summarized again, recursively, forever.
 SUMMARIZER_SCRATCH_DIR = LOG_ROOT / ".summarizer-scratch"
 SUMMARIZER_SCRATCH_SLUG = sr.slugify_cwd(str(SUMMARIZER_SCRATCH_DIR))
+
+# Optional, user-maintained list of project paths to leave out of the
+# dashboard (and out of lazy summarization / project-recap generation)
+# entirely — one path or path-prefix per line, `#` comments allowed. Not
+# present by default; nothing is excluded until a user creates this file.
+EXCLUDE_FILE = LOG_ROOT / "recap-exclude.txt"
+
+
+def load_excluded_prefixes() -> list[str]:
+    if not EXCLUDE_FILE.is_file():
+        return []
+    prefixes = []
+    for line in EXCLUDE_FILE.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        prefixes.append(sr.slugify_cwd(line.rstrip("/")))
+    return prefixes
+
+
+# Compared against project *directory slugs* (not raw paths), since a slug
+# is the only project identity collect_json_records/collect_legacy_entries/
+# build_transcript_index have on hand without re-reading a cwd — and
+# slugify_cwd is a plain non-alnum -> "-" substitution, so a path prefix
+# match survives slugification as a slug-string prefix match.
+EXCLUDED_PREFIXES = load_excluded_prefixes()
+
+
+def _is_excluded_slug(slug: str) -> bool:
+    return any(slug == p or slug.startswith(p + "-") for p in EXCLUDED_PREFIXES)
 
 LAZY_SUMMARY_CAP = 5          # max sessions summarized per /recap run
 LIVE_THRESHOLD_SECONDS = 300  # 5 minutes: "still looks in use, don't touch"
@@ -227,6 +259,8 @@ def collect_legacy_entries() -> tuple[dict[str, LegacyEntry], list[LegacyEntry]]
     for project_dir in sorted(LOG_ROOT.iterdir()):
         if not project_dir.is_dir() or project_dir.name == SUMMARIZER_SCRATCH_SLUG:
             continue
+        if _is_excluded_slug(project_dir.name):
+            continue
         for md_file in sorted(project_dir.glob("*.md")):
             entry = load_legacy_entry(md_file)
             if entry is None:
@@ -257,6 +291,8 @@ def collect_json_records() -> dict[str, dict]:
         return records
     for project_dir in sorted(LOG_ROOT.iterdir()):
         if not project_dir.is_dir() or project_dir.name == SUMMARIZER_SCRATCH_SLUG:
+            continue
+        if _is_excluded_slug(project_dir.name):
             continue
         for json_file in sorted(project_dir.glob("*.json")):
             session_id = json_file.stem
@@ -291,6 +327,8 @@ def build_transcript_index() -> dict[str, tuple[str, Path]]:
         return index
     for project_dir in sorted(PROJECTS_ROOT.iterdir()):
         if not project_dir.is_dir() or project_dir.name == SUMMARIZER_SCRATCH_SLUG:
+            continue
+        if _is_excluded_slug(project_dir.name):
             continue
         for jsonl_file in project_dir.glob("*.jsonl"):
             index[jsonl_file.stem] = (project_dir.name, jsonl_file)
@@ -410,6 +448,80 @@ def reconcile_orphans(combined: dict[str, Combined], transcript_index: dict[str,
             transcript_path=jsonl_file,
             is_orphan=True,
         )
+
+
+# --- Context usage (transcript-derived, no LLM call) ------------------------
+
+def scan_transcript_usage(path: Path) -> dict | None:
+    """Best-effort peek at a transcript's own recorded token usage.
+
+    Peak context and total output are DIFFERENT metrics, computed
+    separately and never conflated:
+      - peak_context_tokens: the highest (input + cache_creation_input +
+        cache_read_input) seen on any single assistant turn — a proxy for
+        how full the context window got at its fullest point.
+      - total_output_tokens: the sum of output_tokens across every turn —
+        total generated output for the whole session.
+    Returns None (never an estimate) if the transcript has no usage blocks
+    at all.
+    """
+    peak = 0
+    total_output = 0
+    found = False
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                usage = (d.get("message") or {}).get("usage")
+                if not usage:
+                    continue
+                found = True
+                context_tokens = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                )
+                peak = max(peak, context_tokens)
+                total_output += usage.get("output_tokens", 0)
+    except OSError:
+        return None
+    if not found:
+        return None
+    return {"peak_context_tokens": peak, "total_output_tokens": total_output}
+
+
+def get_usage_stats(c: Combined) -> dict | None:
+    """Cached, transcript-mtime-gated context-usage numbers for one session
+    — recomputed only when the transcript has grown since it was last
+    scanned (same mtime-guard pattern as "checkpoint"), so a full rescan
+    doesn't happen on every single /recap run."""
+    if c.transcript_path is None or not c.session_id:
+        return None
+    try:
+        mtime_iso = _iso(datetime.fromtimestamp(c.transcript_path.stat().st_mtime, tz=timezone.utc))
+    except OSError:
+        return None
+
+    cached = c.record.get("usage")
+    if cached and cached.get("_ts", "") >= mtime_iso:
+        return cached if cached.get("peak_context_tokens") is not None else None
+
+    stats = scan_transcript_usage(c.transcript_path)
+    slug = c.transcript_path.parent.name
+    sr.merge_section(
+        slug, c.session_id, "usage",
+        stats if stats is not None else {"peak_context_tokens": None, "total_output_tokens": None},
+        mtime_iso,
+    )
+    return stats
 
 
 # --- Staleness / liveness / lazy summarization ------------------------------
@@ -671,7 +783,9 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
 
         force_command = None
         if pending_label is not None and c.session_id:
-            force_command = f"python3 ~/.claude/scripts/session_dashboard.py --summarize-session {c.session_id}"
+            force_command = f"python3 {SELF_PATH} --summarize-session {c.session_id}"
+
+        usage_stats = get_usage_stats(c)
 
         data.append(
             {
@@ -692,12 +806,135 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
                 "summary_at": summary_at,
                 "pending_label": pending_label,
                 "force_command": force_command,
+                "context_peak_tokens": usage_stats["peak_context_tokens"] if usage_stats else None,
+                "context_total_output_tokens": usage_stats["total_output_tokens"] if usage_stats else None,
             }
         )
 
     # No-session-id legacy entries (very old format) can't be deduped or
     # cross-checked against transcripts; show as before.
     return data
+
+
+# --- Project-level recap synthesis ------------------------------------------
+
+PROJECT_RECAP_CANDIDATE_COUNT = 5  # how many recent summarized sessions feed one recap
+PROJECT_RECAP_CAP = 3              # max project recaps (re)generated per /recap run
+
+
+def _project_recap_path(slug: str) -> Path:
+    return LOG_ROOT / slug / "project_recap.json"
+
+
+def _read_project_recap(slug: str) -> dict | None:
+    try:
+        return json.loads(_project_recap_path(slug).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_project_recap(slug: str, data: dict) -> None:
+    path = _project_recap_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".project_recap.tmp-{os.getpid()}.json"
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def _effective_slug(c: Combined) -> str | None:
+    if c.transcript_path is not None:
+        return c.transcript_path.parent.name
+    if c.cwd:
+        return sr.slugify_cwd(c.cwd)
+    return None
+
+
+def _session_summary_for_recap(c: Combined) -> dict | None:
+    """A session's own summary text, in the shape run_project_recap wants —
+    only for sessions with a REAL summary (never "Not yet summarized.")."""
+    summary = c.record.get("summary")
+    if not summary and c.legacy and not c.legacy.is_placeholder:
+        summary = {
+            "worked_on": c.legacy.worked_on,
+            "completed": c.legacy.completed,
+            "next_action": c.legacy.next_action,
+            "summary_at": c.legacy.ended_at,
+        }
+    if not summary:
+        return None
+    return {
+        "session_id": c.session_id,
+        "worked_on": summary.get("worked_on", ""),
+        "completed": summary.get("completed", ""),
+        "next_action": summary.get("next_action", ""),
+        "summary_at": summary.get("summary_at", ""),
+    }
+
+
+def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
+    """Synthesize a short recap per project from its most recent summarized
+    sessions, caching the result in <slug>/project_recap.json and only
+    regenerating when the contributing session set/summaries have changed
+    since the cached recap was made. Capped per run like lazy session
+    summarization — this makes one `claude -p` call per (re)generated
+    project, not per session.
+
+    Returns {project_display_name: recap_text} for every project that has
+    a usable recap (cached or freshly generated) — projects with no real
+    session summaries yet are simply absent, never given a fabricated line.
+    """
+    now = _now()
+    by_slug: dict[str, list[Combined]] = {}
+    for c in combined.values():
+        slug = _effective_slug(c)
+        if slug is None or slug == SUMMARIZER_SCRATCH_SLUG:
+            continue
+        by_slug.setdefault(slug, []).append(c)
+
+    recaps: dict[str, str] = {}
+    to_regenerate: list[tuple[str, list[dict], str, list[list[str]]]] = []
+
+    for slug, sessions in by_slug.items():
+        sessions.sort(key=lambda c: _last_activity(c) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        summarized = [_session_summary_for_recap(c) for c in sessions]
+        summarized = [s for s in summarized if s][:PROJECT_RECAP_CANDIDATE_COUNT]
+        if not summarized:
+            continue
+
+        rep_cwd = next((c.cwd for c in sessions if c.cwd), None)
+        display_name = project_display_name(rep_cwd, slug)
+
+        signature = [[s["session_id"] or "", s["summary_at"]] for s in summarized]
+        cached = _read_project_recap(slug)
+        if cached and cached.get("based_on") == signature:
+            recaps[display_name] = cached["recap_text"]
+            continue
+
+        # Don't recap while the most recent contributing session still
+        # looks live — its summary (and thus the recap built from it) is
+        # about to be stale anyway.
+        if _is_live(sessions[0], now):
+            if cached:
+                recaps[display_name] = cached["recap_text"]
+            continue
+
+        to_regenerate.append((slug, summarized, display_name, signature))
+
+    for slug, summarized, display_name, signature in to_regenerate[:PROJECT_RECAP_CAP]:
+        recap_text = ss.run_project_recap(slug, summarized)
+        if recap_text:
+            _write_project_recap(slug, {
+                "recap_text": recap_text,
+                "generated_at": _iso(now),
+                "based_on": signature,
+            })
+            recaps[display_name] = recap_text
+        else:
+            cached = _read_project_recap(slug)
+            if cached:
+                recaps[display_name] = cached["recap_text"]
+
+    return recaps
 
 
 def add_legacy_no_id_entries(data: list[dict], no_id_entries: list[LegacyEntry]) -> None:
@@ -746,11 +983,17 @@ def _relative_label(iso_ts: str | None) -> str:
     return f"{int(secs // 86400)}d ago"
 
 
-def render_html(data: list[dict]) -> str:
+def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) -> str:
     data.sort(key=lambda d: d["ended_at"], reverse=True)
     data_json = json.dumps(data).replace("</", "<\\/")
+    recaps_json = json.dumps(project_recaps or {}).replace("</", "<\\/")
 
     generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    exclusion_note = (
+        f" {len(EXCLUDED_PREFIXES)} project path(s) are excluded from this dashboard "
+        f"(see ~/.claude/session-logs/recap-exclude.txt)."
+        if EXCLUDED_PREFIXES else ""
+    )
 
     return f"""<!doctype html>
 <html>
@@ -779,6 +1022,8 @@ def render_html(data: list[dict]) -> str:
   header.page-head {{ padding: 20px 0 12px; }}
   h1 {{ font-size: 1.4rem; margin: 0 0 4px; }}
   .subtitle {{ color: var(--muted); font-size: 0.85rem; }}
+  .privacy-note {{ color: var(--muted); font-size: 0.78rem; margin: 4px 0 16px; line-height: 1.4; }}
+  .privacy-note code {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }}
 
   .overview {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }}
   button.stat {{ flex: 1 1 150px; background: var(--card-bg); color: var(--fg); border: 1px solid var(--border);
@@ -811,6 +1056,7 @@ def render_html(data: list[dict]) -> str:
   .project-card:hover {{ border-color: var(--accent); }}
   .project-card-head {{ margin-bottom: 8px; }}
   .project-card-chips {{ font-size: 0.76rem; color: var(--unknown); font-weight: 600; margin-bottom: 10px; }}
+  .project-recap {{ font-size: 0.82rem; color: var(--fg); line-height: 1.4; margin-bottom: 10px; }}
   .project-preview {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }}
   .preview-row {{ display: flex; align-items: center; gap: 7px; font-size: 0.82rem; }}
   .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; }}
@@ -889,8 +1135,15 @@ def render_html(data: list[dict]) -> str:
 <div class="wrap">
   <header class="page-head">
     <h1>Claude Work Recap</h1>
-    <div class="subtitle">Generated {generated_at} · local only, never uploaded anywhere</div>
+    <div class="subtitle">Generated {generated_at} · dashboard data stays on this machine</div>
   </header>
+
+  <div class="privacy-note">
+    Session summaries and project recaps are generated by a local
+    <code>claude -p</code> call, which sends that session's transcript to
+    your configured Claude model to produce the summary text — this is the
+    only network activity anywhere in this pipeline.{exclusion_note}
+  </div>
 
   <div class="overview" id="overview"></div>
 
@@ -918,6 +1171,7 @@ def render_html(data: list[dict]) -> str:
 <script>
 const SESSIONS = {data_json};
 SESSIONS.forEach((s, i) => {{ s.idx = i; }});
+const PROJECT_RECAPS = {recaps_json};
 
 const SOURCE_LABEL = {{"session_end": "session end", "recap_reconciliation": "recap check", "legacy_md": "earlier log"}};
 
@@ -1026,6 +1280,11 @@ function formatRelative(iso) {{
   return Math.floor(secs / 86400) + "d ago";
 }}
 
+function formatTokens(n) {{
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(/\\.0$/, "") + "k";
+  return String(n);
+}}
+
 function fallbackCopy(text, onDone) {{
   const ta = document.createElement("textarea");
   ta.value = text;
@@ -1117,6 +1376,15 @@ function buildCard(s, opts) {{
   }}
   if (s.next_action_optional) {{
     renderField(details, "Optional follow-up", s.next_action_optional);
+  }}
+  if (s.context_peak_tokens != null || s.context_total_output_tokens != null) {{
+    const usageField = el("div", {{className: "field"}});
+    usageField.appendChild(el("span", {{className: "k", text: "Context usage (from transcript, approx.)"}}));
+    const parts = [];
+    if (s.context_peak_tokens != null) parts.push(`Peak context ~${{formatTokens(s.context_peak_tokens)}} tokens`);
+    if (s.context_total_output_tokens != null) parts.push(`total output ~${{formatTokens(s.context_total_output_tokens)}} tokens`);
+    usageField.appendChild(el("span", {{text: parts.join(" · ")}}));
+    details.appendChild(usageField);
   }}
   if (s.resume_command) {{
     const resumeField = el("div", {{className: "field"}});
@@ -1212,6 +1480,11 @@ function renderProjectGrid(filtered) {{
     head.appendChild(el("div", {{className: "project-name", text: project}}));
     head.appendChild(el("div", {{className: "project-path", text: sessions[0].cwd_short}}));
     card.appendChild(head);
+
+    const recap = PROJECT_RECAPS[project];
+    if (recap) {{
+      card.appendChild(el("div", {{className: "project-recap", text: recap}}));
+    }}
 
     const counts = {{}};
     for (const s of sessions) {{
@@ -1331,11 +1604,13 @@ def generate_dashboard(force_session_id: str | None = None) -> Path:
     reconcile_orphans(combined, transcript_index)
     fill_missing_cwd_from_transcripts(combined)
 
+    project_recaps = run_project_recaps(combined)
+
     data = build_session_data(combined)
     add_legacy_no_id_entries(data, legacy_no_id)
 
     OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    OUT_FILE.write_text(render_html(data))
+    OUT_FILE.write_text(render_html(data, project_recaps))
     return OUT_FILE
 
 

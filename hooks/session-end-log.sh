@@ -39,6 +39,7 @@ if [ -n "${CLAUDE_SESSION_LOG_SUMMARIZER:-}" ]; then
   exit 0
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_ROOT="$HOME/.claude/session-logs"
 DEBUG_LOG="$LOG_ROOT/.last-payload.json"
 mkdir -p "$LOG_ROOT"
@@ -68,7 +69,7 @@ fi
 # how Claude Code names transcript files under ~/.claude/projects/<slug>/.
 SESSION_ID="$(basename "$TRANSCRIPT_PATH" .jsonl)"
 
-RECORD_HELPER="$HOME/.claude/scripts/session_record.py"
+RECORD_HELPER="$SCRIPT_DIR/../scripts/session_record.py"
 PROJECT_SLUG="$(python3 "$RECORD_HELPER" slugify "$CWD" 2>/dev/null || true)"
 if [ -z "$PROJECT_SLUG" ]; then
   exit 0
@@ -80,17 +81,17 @@ ENDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # survives even if the worker below never completes.
 END_DATA="$(python3 -c 'import json,sys; print(json.dumps({"ended_at": sys.argv[1], "reason": sys.argv[2], "cwd": sys.argv[3]}))' "$ENDED_AT" "$REASON" "$CWD")"
 python3 "$RECORD_HELPER" merge-section \
-  --project-slug "$PROJECT_SLUG" \
-  --session-id "$SESSION_ID" \
-  --section "end" \
-  --data "$END_DATA" \
-  --event-ts "$ENDED_AT" \
+  --project-slug="$PROJECT_SLUG" \
+  --session-id="$SESSION_ID" \
+  --section="end" \
+  --data="$END_DATA" \
+  --event-ts="$ENDED_AT" \
   >/dev/null 2>&1 || true
 
 # Hand the slow part off to a fully detached worker (new process
 # session/group via start_new_session) so it survives this hook being
 # cancelled or timed out by the harness, then return immediately.
-WORKER="$HOME/.claude/hooks/session-summarize-worker.sh"
+WORKER="$SCRIPT_DIR/session-summarize-worker.sh"
 python3 -c '
 import subprocess, sys
 subprocess.Popen(

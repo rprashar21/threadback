@@ -21,6 +21,7 @@ if [ -n "${CLAUDE_SESSION_LOG_SUMMARIZER:-}" ]; then
   exit 0
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRANSCRIPT_PATH="$1"
 PROJECT_SLUG="$2"
 SESSION_ID="$3"
@@ -30,7 +31,7 @@ import sys
 sys.path.insert(0, sys.argv[1])
 import session_summarize as ss
 ss.run_bounded_summary(sys.argv[2], sys.argv[3], sys.argv[4], "session_end", timeout_secs=180)
-' "$HOME/.claude/scripts" "$TRANSCRIPT_PATH" "$PROJECT_SLUG" "$SESSION_ID" \
+' "$SCRIPT_DIR/../scripts" "$TRANSCRIPT_PATH" "$PROJECT_SLUG" "$SESSION_ID" \
   >/dev/null 2>&1 || true
 
 exit 0

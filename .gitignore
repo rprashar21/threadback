@@ -11,3 +11,7 @@ __pycache__/
 .env
 venv/
 .venv/
+
+# npm installer: vendored copy of hooks/scripts, rebuilt by npx/scripts/prepack.js
+npx/vendor/
+npx/node_modules/

@@ -56,10 +56,17 @@ PROMPT_TEMPLATE = (
     "this rather than guessing — do not default to In Progress or Completed when the "
     "evidence is unclear. "
     "\n\n"
-    "In 'Worked On' and 'Completed', distinguish clearly between what was actually "
-    "implemented/done (state it as done) versus what was only discussed, proposed, or "
-    "planned (say 'discussed' or 'planned', never 'implemented' or 'completed' for "
-    "those). "
+    "In 'Worked On' and 'Completed', classify each concrete claim as one of three "
+    "kinds, and say which: "
+    "(1) verified — actually implemented/done, with a file edited, a command that ran "
+    "and succeeded, or a result you can see confirmed in the transcript; state it as "
+    "done, and add a short evidence pointer in parentheses (a file path, the command, "
+    "or the test/result) right after the claim; "
+    "(2) discussed — only proposed, suggested, or planned, never say 'implemented' or "
+    "'completed' for these, say 'discussed' or 'planned' instead; "
+    "(3) uncertain — you cannot tell from the transcript whether it actually happened "
+    "(e.g. a tool call's result was cut off, ambiguous, or never shown) — say so "
+    "explicitly ('unclear whether this succeeded') rather than guessing either way. "
     "\n\n"
     "In 'Next Action': if the requested task is fully done, write exactly 'No required "
     "next action.' Never state an optional idea or suggestion as if it were required — "
@@ -162,3 +169,84 @@ def run_bounded_summary(
         "summarized_through_bytes": bytes_at_read,
     }
     return sr.merge_section(project_slug, session_id, "summary", data, summary_at)
+
+
+PROJECT_RECAP_PROMPT_TEMPLATE = (
+    "Below are session summaries for the same project, most recent first. "
+    "Write AT MOST TWO SHORT SENTENCES to {body_path} synthesizing what these "
+    "sessions actually accomplished — do not just concatenate them. "
+    "If the sessions cover unrelated threads of work rather than one "
+    "continuous effort, say so briefly instead of pretending they are one "
+    "task (e.g. 'Two unrelated threads: X and Y.'). Mention the single most "
+    "relevant next step only if one clearly stands out across the sessions; "
+    "otherwise omit it. Base this only on the summaries given below — do not "
+    "invent anything. Do not include a preamble, headings, or quotation "
+    "marks, just the plain sentence(s).\n\n"
+    "{sessions_text}"
+)
+
+
+def run_project_recap(
+    project_slug: str,
+    sessions: list[dict],
+    timeout_secs: int = 60,
+) -> str | None:
+    """One bounded `claude -p` call that synthesizes a >=1, <=2 sentence
+    project-level recap from already-computed session summaries (no new
+    transcript read — this is cheap relative to per-session summarization).
+
+    `sessions` is a list of {"worked_on": ..., "completed": ..., "next_action":
+    ...} dicts, most recent first. Returns the recap text, or None on any
+    failure/timeout/empty result — callers should treat that as "no recap
+    available yet", never fabricate one.
+    """
+    if not sessions:
+        return None
+
+    parts = []
+    for i, s in enumerate(sessions, 1):
+        parts.append(
+            f"Session {i}:\nWorked on: {s.get('worked_on', '')}\n"
+            f"Completed: {s.get('completed', '')}\nNext action: {s.get('next_action', '')}"
+        )
+    sessions_text = "\n\n".join(parts)
+
+    body_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-recap-{project_slug}-{os.getpid()}.md"
+    prompt = PROJECT_RECAP_PROMPT_TEMPLATE.format(body_path=str(body_path), sessions_text=sessions_text)
+
+    env = dict(os.environ)
+    env["CLAUDE_SESSION_LOG_SUMMARIZER"] = "1"
+    SUMMARIZER_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        proc = subprocess.Popen(
+            ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Write"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            cwd=str(SUMMARIZER_SCRATCH_DIR),
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+
+    try:
+        proc.wait(timeout=timeout_secs)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    if not body_path.exists() or body_path.stat().st_size == 0:
+        return None
+
+    text = body_path.read_text().strip()
+    try:
+        body_path.unlink()
+    except OSError:
+        pass
+
+    return text or None

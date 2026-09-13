@@ -1,0 +1,20 @@
+{
+  "name": "@8thlight/recap-dashboard-install",
+  "version": "0.1.0",
+  "description": "Installer for the recap-dashboard Claude Code hooks + local session recap dashboard.",
+  "bin": {
+    "recap-dashboard-install": "bin/install.js"
+  },
+  "files": [
+    "bin",
+    "vendor"
+  ],
+  "scripts": {
+    "prepack": "node scripts/prepack.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "UNLICENSED",
+  "private": false
+}

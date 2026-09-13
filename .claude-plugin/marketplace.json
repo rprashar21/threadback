@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "recap-dashboard",
+  "description": "Self-hosted marketplace for the recap-dashboard plugin: a local, cross-project work recap for Claude Code.",
+  "owner": {
+    "name": "8th Light"
+  },
+  "plugins": [
+    {
+      "name": "recap-dashboard",
+      "description": "Local, cross-project work recap for Claude Code: hooks record session start/activity/end, and a static HTML dashboard shows what's done, in progress, or blocked, with a one-command resume for any session.",
+      "author": {
+        "name": "8th Light"
+      },
+      "source": "."
+    }
+  ]
+}
