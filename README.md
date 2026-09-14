@@ -31,8 +31,8 @@ npx/       standalone installer, published separately (see below)
 ### Option A: as a Claude Code plugin (recommended)
 
 ```
-claude plugin marketplace add <owner>/recap-dashboard
-claude plugin install recap-dashboard@recap-dashboard
+claude plugin marketplace add rprashar21/threadback
+claude plugin install threadback@threadback
 ```
 
 This registers the `SessionStart`/`Stop`/`SessionEnd` hooks and the `/recap`
