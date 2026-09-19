@@ -2,9 +2,8 @@
 """Shared bounded-summarizer logic.
 
 Used by BOTH the SessionEnd worker hook (session-summarize-worker.sh) and
-session_dashboard.py's lazy-summarization pass, so the prompt and the
-content-coverage merge logic live in exactly one place instead of being
-maintained twice.
+session_dashboard.py's lazy-summarization pass, so deterministic evidence
+extraction, the prompt, and content-coverage merge logic live in one place.
 
 Never runs on a per-turn basis — only ever invoked from SessionEnd (once,
 per session end) or from a `/recap` run backfilling a stale/missing summary
@@ -12,11 +11,14 @@ per session end) or from a `/recap` run backfilling a stale/missing summary
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import signal
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,47 @@ import session_record as sr  # noqa: E402
 
 SECTION_NAMES = ["Status", "Worked On", "Completed", "Stopped At", "Next Action"]
 VALID_STATUSES = {"Completed", "In Progress", "Blocked", "Unknown"}
+PROMPT_VERSION = "session-summary-v2-bounded-evidence"
+
+# The model never receives the raw transcript. A deterministic local pass keeps
+# only evidence-bearing events and enforces both per-event and whole-input caps.
+MAX_EVIDENCE_CHARS = 40_000
+MAX_MESSAGE_CHARS = 4_000
+MAX_TOOL_INPUT_CHARS = 1_000
+MAX_TOOL_RESULT_CHARS = 2_000
+MAX_SUMMARY_FIELD_CHARS = 1_500
+EVIDENCE_TRUNCATION_MARKER = "\n\n[... middle events omitted by deterministic input budget ...]\n\n"
+DEFAULT_SUMMARY_MAX_BUDGET_USD = "0.10"
+
+
+@dataclass(frozen=True)
+class PreparedEvidence:
+    text: str
+    evidence_hash: str
+    transcript_bytes: int
+
+    @property
+    def input_chars(self) -> int:
+        return len(self.text)
+
+
+def _summary_max_budget_usd() -> str:
+    raw = os.environ.get("RECAP_SUMMARY_MAX_BUDGET_USD", DEFAULT_SUMMARY_MAX_BUDGET_USD)
+    try:
+        if float(raw) > 0:
+            return raw
+    except ValueError:
+        pass
+    return DEFAULT_SUMMARY_MAX_BUDGET_USD
+
+
+def _claude_summary_command(prompt: str) -> list[str]:
+    return [
+        "claude", "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--allowedTools", "Read,Write",
+        "--max-budget-usd", _summary_max_budget_usd(),
+    ]
 
 # The `claude -p` subprocess spawned below is ITSELF a full Claude Code
 # session with its own session_id and transcript. The CLAUDE_SESSION_LOG_
@@ -104,7 +147,9 @@ def _read_and_discard(path: Path) -> str:
     return text
 
 PROMPT_TEMPLATE = (
-    "Read the Claude Code session transcript at {transcript_path} (JSONL format). "
+    "Read the bounded evidence extracted from a Claude Code session at {evidence_path}. "
+    "The file was produced deterministically from the transcript: thinking, attachments, "
+    "metadata, and oversized tool output were removed before this call. "
     "Write a concise session summary as markdown to {body_path} with exactly these "
     "sections: ## Status, ## Worked On, ## Completed, ## Stopped At, ## Next Action. "
     "\n\n"
@@ -136,10 +181,135 @@ PROMPT_TEMPLATE = (
     "if there is one, prefix it on its own line with 'Optional:' instead of listing it "
     "as the next step. "
     "\n\n"
-    "Base every section only on what actually happened in the transcript, with nothing "
+    "Base every section only on the supplied evidence, with nothing "
     "invented. If a section has nothing relevant, write 'Nothing notable.' under it. Do "
     "not include a preamble or explanation, just write the file."
 )
+
+
+def _clip(value: str, limit: int) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _text_blocks(content: object, block_type: str = "text") -> list[str]:
+    if isinstance(content, str):
+        return [content] if block_type == "text" else []
+    if not isinstance(content, list):
+        return []
+    values = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != block_type:
+            continue
+        value = block.get("text") if block_type == "text" else block.get("content")
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            nested = [
+                item if isinstance(item, str) else item.get("text", "")
+                for item in value
+                if isinstance(item, (str, dict))
+            ]
+            if any(nested):
+                values.append("\n".join(nested))
+    return values
+
+
+def _compact_tool_input(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    # Describe what was attempted without copying Write/Edit bodies, complete
+    # prompts, or other potentially enormous arguments.
+    useful_keys = (
+        "command", "cmd", "file_path", "path", "description", "query",
+        "pattern", "glob", "url", "old_path", "new_path",
+    )
+    compact = {key: value[key] for key in useful_keys if key in value}
+    if not compact:
+        compact = {"argument_keys": sorted(str(key) for key in value.keys())}
+    return _clip(json.dumps(compact, sort_keys=True, ensure_ascii=False), MAX_TOOL_INPUT_CHARS)
+
+
+def _events_from_record(record: dict) -> list[str]:
+    event_type = record.get("type")
+    message = record.get("message") or {}
+    content = message.get("content")
+    events: list[str] = []
+
+    if event_type == "user":
+        for value in _text_blocks(content):
+            if value.strip():
+                events.append("USER\n" + _clip(value, MAX_MESSAGE_CHARS))
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                result = "\n".join(_text_blocks([block], "tool_result"))
+                state = "error" if block.get("is_error") else "result"
+                events.append(f"TOOL {state.upper()}\n" + _clip(result, MAX_TOOL_RESULT_CHARS))
+
+    elif event_type == "assistant":
+        for value in _text_blocks(content):
+            if value.strip():
+                events.append("ASSISTANT\n" + _clip(value, MAX_MESSAGE_CHARS))
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                name = str(block.get("name") or "unknown")
+                events.append(f"TOOL USE {name}\n" + _compact_tool_input(block.get("input")))
+
+    return [event for event in events if event.strip()]
+
+
+def _bounded_event_text(events: list[str]) -> str:
+    full = "\n\n".join(events)
+    if len(full) <= MAX_EVIDENCE_CHARS:
+        return full
+
+    marker = EVIDENCE_TRUNCATION_MARKER
+    available = MAX_EVIDENCE_CHARS - len(marker)
+    head_budget = available // 3
+    tail_budget = available - head_budget
+    head = full[:head_budget].rstrip()
+    tail = full[-tail_budget:].lstrip()
+    return head + marker + tail
+
+
+def prepare_summary_evidence(transcript_path: str) -> PreparedEvidence | None:
+    """Extract a stable, size-bounded evidence document from transcript JSONL."""
+    transcript = Path(transcript_path)
+    if not transcript.is_file():
+        return None
+    try:
+        transcript_bytes = transcript.stat().st_size
+        events: list[str] = []
+        with transcript.open("r", encoding="utf-8", errors="ignore") as source:
+            for line in source:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    events.extend(_events_from_record(record))
+    except OSError:
+        return None
+
+    text = _bounded_event_text(events)
+    if not text:
+        return None
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return PreparedEvidence(text=text, evidence_hash=digest, transcript_bytes=transcript_bytes)
+
+
+def summary_matches_evidence(summary: object, prepared: PreparedEvidence) -> bool:
+    return bool(
+        isinstance(summary, dict)
+        and summary.get("prompt_version") == PROMPT_VERSION
+        and summary.get("evidence_hash") == prepared.evidence_hash
+    )
 
 
 def parse_summary_body(text: str) -> dict:
@@ -157,10 +327,10 @@ def parse_summary_body(text: str) -> dict:
 
     return {
         "status": status,
-        "worked_on": sections.get("Worked On", "").strip() or "Nothing notable.",
-        "completed": sections.get("Completed", "").strip() or "Nothing notable.",
-        "stopped_at": sections.get("Stopped At", "").strip() or "Nothing notable.",
-        "next_action": sections.get("Next Action", "").strip() or "Nothing notable.",
+        "worked_on": _clip(sections.get("Worked On", ""), MAX_SUMMARY_FIELD_CHARS) or "Nothing notable.",
+        "completed": _clip(sections.get("Completed", ""), MAX_SUMMARY_FIELD_CHARS) or "Nothing notable.",
+        "stopped_at": _clip(sections.get("Stopped At", ""), MAX_SUMMARY_FIELD_CHARS) or "Nothing notable.",
+        "next_action": _clip(sections.get("Next Action", ""), MAX_SUMMARY_FIELD_CHARS) or "Nothing notable.",
     }
 
 
@@ -170,22 +340,38 @@ def run_bounded_summary(
     session_id: str,
     summary_source: str,
     timeout_secs: int = 180,
+    prepared: PreparedEvidence | None = None,
 ) -> bool:
-    """Run the bounded, one-shot `claude -p` summarizer against
-    `transcript_path` and merge the result into the session's "summary"
-    section (gated by content coverage — see session_record.py).
+    """Extract bounded evidence, run one `claude -p` summary call when the
+    evidence hash is not cached, and merge the result into the record's
+    "summary" section (gated by content coverage — see session_record.py).
 
     Returns True if a summary was produced AND accepted by the
     content-coverage guard; False on any failure, timeout, or if a
     since-produced summary already covered at least as much content.
     """
     transcript = Path(transcript_path)
-    if not transcript.is_file():
+    prepared = prepared or prepare_summary_evidence(transcript_path)
+    if prepared is None:
         return False
 
-    bytes_at_read = transcript.stat().st_size
+    event_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    existing = sr.read_record(project_slug, session_id).get("summary", {})
+    if summary_matches_evidence(existing, prepared):
+        # The transcript may have grown only through ignored metadata. Advance
+        # coverage without paying for identical semantic input a second time.
+        cached = {key: value for key, value in existing.items() if key != "_ts"}
+        cached["summarized_through_bytes"] = prepared.transcript_bytes
+        return sr.merge_section(project_slug, session_id, "summary", cached, event_ts)
+
     body_path = transcript.parent / f".tmp-summary-{session_id}-{os.getpid()}.md"
-    prompt = PROMPT_TEMPLATE.format(transcript_path=transcript_path, body_path=str(body_path))
+    evidence_path = transcript.parent / f".tmp-evidence-{session_id}-{os.getpid()}.txt"
+    try:
+        evidence_path.write_text(prepared.text)
+    except OSError as e:
+        _log_failure(f"session summary ({session_id})", f"failed to write bounded evidence: {e}")
+        return False
+    prompt = PROMPT_TEMPLATE.format(evidence_path=str(evidence_path), body_path=str(body_path))
 
     env = dict(os.environ)
     env["CLAUDE_SESSION_LOG_SUMMARIZER"] = "1"
@@ -200,7 +386,7 @@ def run_bounded_summary(
         # can defeat the timeout below entirely. See _terminate_process_group.
         with stderr_path.open("wb") as stderr_f:
             proc = subprocess.Popen(
-                ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Read,Write"],
+                _claude_summary_command(prompt),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_f,
@@ -209,6 +395,8 @@ def run_bounded_summary(
                 start_new_session=True,
             )
     except OSError as e:
+        _read_and_discard(evidence_path)
+        _read_and_discard(stderr_path)
         _log_failure(f"session summary ({session_id})", f"failed to launch claude -p: {e}")
         return False
 
@@ -218,6 +406,8 @@ def run_bounded_summary(
     except subprocess.TimeoutExpired:
         timed_out = True
         _terminate_process_group(proc)
+
+    _read_and_discard(evidence_path)
 
     if not body_path.exists() or body_path.stat().st_size == 0:
         stderr_text = _read_and_discard(stderr_path)
@@ -239,93 +429,9 @@ def run_bounded_summary(
         **parsed,
         "summary_source": summary_source,
         "summary_at": summary_at,
-        "summarized_through_bytes": bytes_at_read,
+        "summarized_through_bytes": prepared.transcript_bytes,
+        "prompt_version": PROMPT_VERSION,
+        "evidence_hash": prepared.evidence_hash,
+        "evidence_chars": prepared.input_chars,
     }
     return sr.merge_section(project_slug, session_id, "summary", data, summary_at)
-
-
-PROJECT_RECAP_PROMPT_TEMPLATE = (
-    "Below are session summaries for the same project, most recent first. "
-    "Write AT MOST TWO SHORT SENTENCES to {body_path} synthesizing what these "
-    "sessions actually accomplished — do not just concatenate them. "
-    "If the sessions cover unrelated threads of work rather than one "
-    "continuous effort, say so briefly instead of pretending they are one "
-    "task (e.g. 'Two unrelated threads: X and Y.'). Mention the single most "
-    "relevant next step only if one clearly stands out across the sessions; "
-    "otherwise omit it. Base this only on the summaries given below — do not "
-    "invent anything. Do not include a preamble, headings, or quotation "
-    "marks, just the plain sentence(s).\n\n"
-    "{sessions_text}"
-)
-
-
-def run_project_recap(
-    project_slug: str,
-    sessions: list[dict],
-    timeout_secs: int = 60,
-) -> str | None:
-    """One bounded `claude -p` call that synthesizes a >=1, <=2 sentence
-    project-level recap from already-computed session summaries (no new
-    transcript read — this is cheap relative to per-session summarization).
-
-    `sessions` is a list of {"worked_on": ..., "completed": ..., "next_action":
-    ...} dicts, most recent first. Returns the recap text, or None on any
-    failure/timeout/empty result — callers should treat that as "no recap
-    available yet", never fabricate one.
-    """
-    if not sessions:
-        return None
-
-    parts = []
-    for i, s in enumerate(sessions, 1):
-        parts.append(
-            f"Session {i}:\nWorked on: {s.get('worked_on', '')}\n"
-            f"Completed: {s.get('completed', '')}\nNext action: {s.get('next_action', '')}"
-        )
-    sessions_text = "\n\n".join(parts)
-
-    body_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-recap-{project_slug}-{os.getpid()}.md"
-    prompt = PROJECT_RECAP_PROMPT_TEMPLATE.format(body_path=str(body_path), sessions_text=sessions_text)
-
-    env = dict(os.environ)
-    env["CLAUDE_SESSION_LOG_SUMMARIZER"] = "1"
-    SUMMARIZER_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-    stderr_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-recap-stderr-{project_slug}-{os.getpid()}.log"
-
-    try:
-        with stderr_path.open("wb") as stderr_f:
-            proc = subprocess.Popen(
-                ["claude", "-p", prompt, "--dangerously-skip-permissions", "--allowedTools", "Write"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_f,
-                env=env,
-                cwd=str(SUMMARIZER_SCRATCH_DIR),
-                start_new_session=True,
-            )
-    except OSError as e:
-        _log_failure(f"project recap ({project_slug})", f"failed to launch claude -p: {e}")
-        return None
-
-    timed_out = False
-    try:
-        proc.wait(timeout=timeout_secs)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _terminate_process_group(proc)
-
-    if not body_path.exists() or body_path.stat().st_size == 0:
-        stderr_text = _read_and_discard(stderr_path)
-        reason = f"timed out after {timeout_secs}s" if timed_out else f"exit code {proc.returncode}, no output written"
-        _log_failure(f"project recap ({project_slug})", reason, stderr_text)
-        return None
-
-    _read_and_discard(stderr_path)
-
-    text = body_path.read_text().strip()
-    try:
-        body_path.unlink()
-    except OSError:
-        pass
-
-    return text or None

@@ -13,10 +13,11 @@ Combines three sources of truth, keyed by session_id:
      (a crashed/killed session, or a hook that never fired) is reconciled
      into a synthesized entry instead of silently vanishing.
 
-On every run, this script also backfills a real summary (via the same
-bounded, one-shot `claude -p` call used by SessionEnd — see
-session_summarize.py) for a small, capped number of sessions whose summary
-is missing or stale, skipping anything that still looks actively in use.
+On every run, this script also backfills real summaries from deterministic,
+size-bounded transcript evidence (via the same one-shot `claude -p` call used
+by SessionEnd — see session_summarize.py). Model calls and aggregate input are
+hard-capped per run, and project recaps are assembled locally with no extra
+model call. Sessions that still look actively in use are skipped.
 Status is NEVER inferred from a checkpoint's mere existence — a session
 without a real summarizer-produced status is always shown as "Unknown",
 honestly labeled with its last known activity.
@@ -28,11 +29,9 @@ session's summary immediately, bypassing the per-run cap.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -84,8 +83,11 @@ EXCLUDED_PREFIXES = load_excluded_prefixes()
 def _is_excluded_slug(slug: str) -> bool:
     return any(slug == p or slug.startswith(p + "-") for p in EXCLUDED_PREFIXES)
 
-LAZY_SUMMARY_CAP = 5          # max sessions summarized per /recap run
+LAZY_SUMMARY_SCAN_CAP = 20    # newest stale sessions inspected for cache hits
+MAX_SUMMARY_CALLS_PER_RUN = 2 # hard cap on paid/model-backed work per /recap
+MAX_SUMMARY_INPUT_CHARS_PER_RUN = 80_000
 LIVE_THRESHOLD_SECONDS = 300  # 5 minutes: "still looks in use, don't touch"
+LONG_RUNNING_OPEN_SECONDS = 2 * 60 * 60
 SUMMARY_TIMEOUT_SECS = 60     # per-session bound during a /recap run
 
 # Reconciliation exists to catch a session from the last few days that
@@ -655,7 +657,10 @@ def _last_activity(c: Combined) -> datetime | None:
     checkpoint = c.record.get("checkpoint", {})
     end = c.record.get("end", {})
     start = c.record.get("start", {})
-    for ts in (checkpoint.get("checked_at"), end.get("ended_at"), start.get("started_at")):
+    for ts in (
+        checkpoint.get("checked_at"), end.get("ended_at"),
+        start.get("_ts"), start.get("started_at"),
+    ):
         dt = _parse_ts(ts)
         if dt:
             candidates.append(dt)
@@ -685,8 +690,33 @@ def _current_known_bytes(c: Combined) -> int | None:
     return None
 
 
+def _current_opened_at(c: Combined) -> datetime | None:
+    """Latest open lifecycle event, including a resume after an earlier end."""
+    start = c.record.get("start", {})
+    end = c.record.get("end", {})
+    started = _parse_ts(start.get("_ts") or start.get("started_at"))
+    ended = _parse_ts(end.get("_ts") or end.get("ended_at"))
+    if started is not None and (ended is None or started > ended):
+        return started
+    return None
+
+
 def _has_ended(c: Combined) -> bool:
+    if _current_opened_at(c) is not None:
+        return False
     return bool(c.record.get("end")) or c.legacy is not None
+
+
+def _long_running_open_label(c: Combined, now: datetime) -> str | None:
+    opened_at = _current_opened_at(c)
+    if opened_at is None:
+        return None
+    elapsed_seconds = max(0, int((now - opened_at).total_seconds()))
+    if elapsed_seconds < LONG_RUNNING_OPEN_SECONDS:
+        return None
+    total_minutes = elapsed_seconds // 60
+    hours, minutes = divmod(total_minutes, 60)
+    return f"Open for {hours}h {minutes}m" if minutes else f"Open for {hours}h"
 
 
 def _needs_summary(c: Combined) -> bool:
@@ -728,10 +758,14 @@ def run_lazy_summarization(combined: dict[str, Combined], force_session_id: str 
         if c.transcript_path is None:
             print(f"No transcript found on disk for session {force_session_id}.", file=sys.stderr)
             return
+        prepared = ss.prepare_summary_evidence(str(c.transcript_path))
+        if prepared is None:
+            print(f"Could not extract evidence for session {force_session_id}.", file=sys.stderr)
+            return
         slug = sr.slugify_cwd(c.cwd) if c.cwd else c.transcript_path.parent.name
         ss.run_bounded_summary(
             str(c.transcript_path), slug, force_session_id, "recap_reconciliation",
-            timeout_secs=180,
+            timeout_secs=180, prepared=prepared,
         )
         return
 
@@ -740,24 +774,33 @@ def run_lazy_summarization(combined: dict[str, Combined], force_session_id: str 
         if _needs_summary(c) and not _is_live(c, now) and c.transcript_path is not None
     ]
     candidates.sort(key=lambda c: _last_activity(c) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    candidates = candidates[:LAZY_SUMMARY_CAP]
+    candidates = candidates[:LAZY_SUMMARY_SCAN_CAP]
     if not candidates:
         return
 
-    def _summarize(c: Combined) -> None:
+    model_calls = 0
+    input_chars = 0
+    for c in candidates:
+        prepared = ss.prepare_summary_evidence(str(c.transcript_path))
+        if prepared is None:
+            continue
         slug = sr.slugify_cwd(c.cwd) if c.cwd else c.transcript_path.parent.name
+
+        # Cache hits are free: run_bounded_summary only advances byte coverage
+        # and never launches the model when evidence and prompt versions match.
+        is_cache_hit = ss.summary_matches_evidence(c.record.get("summary"), prepared)
+        if not is_cache_hit:
+            if model_calls >= MAX_SUMMARY_CALLS_PER_RUN:
+                continue
+            if input_chars + prepared.input_chars > MAX_SUMMARY_INPUT_CHARS_PER_RUN:
+                continue
+            model_calls += 1
+            input_chars += prepared.input_chars
+
         ss.run_bounded_summary(
             str(c.transcript_path), slug, c.session_id, "recap_reconciliation",
-            timeout_secs=SUMMARY_TIMEOUT_SECS,
+            timeout_secs=SUMMARY_TIMEOUT_SECS, prepared=prepared,
         )
-
-    # Each candidate is a separate `claude -p` subprocess targeting a
-    # different session's record file (session_record.py's per-session flock
-    # already makes concurrent writes safe), so there's no reason to
-    # serialize them — running sequentially made /recap's worst case
-    # ~LAZY_SUMMARY_CAP x SUMMARY_TIMEOUT_SECS instead of ~1x.
-    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
-        list(pool.map(_summarize, candidates))
 
 
 # --- Display-only derived fields --------------------------------------------
@@ -912,6 +955,7 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
 
         last_active = _last_activity(c)
         last_active_iso = _iso(last_active) if last_active else "1970-01-01T00:00:00Z"
+        long_running_label = _long_running_open_label(c, now)
 
         if summary_section:
             # .get() with the same fallbacks parse_summary_body() itself uses
@@ -980,6 +1024,8 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
                 "summary_at": summary_at,
                 "pending_label": pending_label,
                 "force_command": force_command,
+                "long_running_open": long_running_label is not None,
+                "long_running_label": long_running_label,
                 "last_activity_valid": _is_plausible_ts(last_active_iso),
                 "context_peak_tokens": usage_stats["peak_context_tokens"] if usage_stats else None,
                 "context_total_output_tokens": usage_stats["total_output_tokens"] if usage_stats else None,
@@ -991,29 +1037,9 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
     return data
 
 
-# --- Project-level recap synthesis ------------------------------------------
+# --- Deterministic project-level recap --------------------------------------
 
-PROJECT_RECAP_CANDIDATE_COUNT = 5  # how many recent summarized sessions feed one recap
-PROJECT_RECAP_CAP = 3              # max project recaps (re)generated per /recap run
-
-
-def _project_recap_path(slug: str) -> Path:
-    return LOG_ROOT / slug / PROJECT_RECAP_FILENAME
-
-
-def _read_project_recap(slug: str) -> dict | None:
-    try:
-        return json.loads(_project_recap_path(slug).read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _write_project_recap(slug: str, data: dict) -> None:
-    path = _project_recap_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".project_recap.tmp-{os.getpid()}.json"
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)
+PROJECT_RECAP_CANDIDATE_COUNT = 5
 
 
 def _effective_slug(c: Combined) -> str | None:
@@ -1025,11 +1051,11 @@ def _effective_slug(c: Combined) -> str | None:
 
 
 def _session_summary_for_recap(c: Combined) -> dict | None:
-    """A session's own summary text, in the shape run_project_recap wants —
-    only for sessions with a REAL summary (never "Not yet summarized.")."""
+    """Return only real session summaries, never pending placeholders."""
     summary = c.record.get("summary")
     if not summary and c.legacy and not c.legacy.is_placeholder:
         summary = {
+            "status": c.legacy.status,
             "worked_on": c.legacy.worked_on,
             "completed": c.legacy.completed,
             "next_action": c.legacy.next_action,
@@ -1039,6 +1065,7 @@ def _session_summary_for_recap(c: Combined) -> dict | None:
         return None
     return {
         "session_id": c.session_id,
+        "status": summary.get("status", "Unknown"),
         "worked_on": summary.get("worked_on", ""),
         "completed": summary.get("completed", ""),
         "next_action": summary.get("next_action", ""),
@@ -1046,19 +1073,45 @@ def _session_summary_for_recap(c: Combined) -> dict | None:
     }
 
 
-def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
-    """Synthesize a short recap per project from its most recent summarized
-    sessions, caching the result in <slug>/project_recap.json and only
-    regenerating when the contributing session set/summaries have changed
-    since the cached recap was made. Capped per run like lazy session
-    summarization — this makes one `claude -p` call per (re)generated
-    project, not per session.
+def _recap_fragment(summary: dict) -> str | None:
+    for field in ("completed", "worked_on"):
+        value = _as_text(summary.get(field), "")
+        if value.strip().rstrip(".").lower() == "nothing notable":
+            continue
+        fragment = _first_sentence(value).strip().rstrip(".!?")
+        if fragment:
+            return fragment[:240].rstrip()
+    return None
 
-    Returns {project_display_name: recap_text} for every project that has
-    a usable recap (cached or freshly generated) — projects with no real
-    session summaries yet are simply absent, never given a fabricated line.
-    """
-    now = _now()
+
+def deterministic_project_recap(summaries: list[dict]) -> str | None:
+    """Build a stable project recap from existing session summaries only."""
+    subjects: list[str] = []
+    next_action: str | None = None
+    for summary in summaries:
+        fragment = _recap_fragment(summary)
+        if fragment and fragment.casefold() not in {item.casefold() for item in subjects}:
+            subjects.append(fragment)
+
+        raw_next = _as_text(summary.get("next_action"), "").strip()
+        if next_action is None and raw_next and not NO_ACTION_RE.match(raw_next):
+            required, _optional = split_next_action(str(summary.get("status", "Unknown")), raw_next)
+            if required and not NO_ACTION_RE.match(required):
+                next_action = _first_sentence(required).strip().rstrip(".!?")[:240]
+
+    if not subjects:
+        return None
+    if len(subjects) == 1:
+        recap = f"Recent work: {subjects[0]}."
+    else:
+        recap = f"Recent work spans: {subjects[0]}; {subjects[1]}."
+    if next_action:
+        recap += f" Next: {next_action}."
+    return recap
+
+
+def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
+    """Build project recaps locally with no additional model calls."""
     by_slug: dict[str, list[Combined]] = {}
     for c in combined.values():
         slug = _effective_slug(c)
@@ -1067,8 +1120,6 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
         by_slug.setdefault(slug, []).append(c)
 
     recaps: dict[str, str] = {}
-    to_regenerate: list[tuple[str, list[dict], str, list[list[str]]]] = []
-
     for slug, sessions in by_slug.items():
         sessions.sort(key=lambda c: _last_activity(c) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         summarized = [_session_summary_for_recap(c) for c in sessions]
@@ -1078,53 +1129,9 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
 
         rep_cwd = next((c.cwd for c in sessions if c.cwd), None)
         display_name = project_display_name(rep_cwd, slug)
-
-        signature = [[s["session_id"] or "", s["summary_at"]] for s in summarized]
-        cached = _read_project_recap(slug)
-        if cached and cached.get("based_on") == signature:
-            recaps[display_name] = cached["recap_text"]
-            continue
-
-        # Don't recap while the most recent contributing session still
-        # looks live — its summary (and thus the recap built from it) is
-        # about to be stale anyway.
-        if _is_live(sessions[0], now):
-            if cached:
-                recaps[display_name] = cached["recap_text"]
-            continue
-
-        to_regenerate.append((slug, summarized, display_name, signature))
-
-    to_regenerate = to_regenerate[:PROJECT_RECAP_CAP]
-
-    def _recap(item: tuple[str, list[dict], str, list[list[str]]]) -> tuple[str, str, str | None]:
-        slug, summarized, display_name, _signature = item
-        return slug, display_name, ss.run_project_recap(slug, summarized)
-
-    # Each recap is an independent `claude -p` subprocess against a different
-    # project's cache file, so — same reasoning as the session-summary pool
-    # above — there's no reason to serialize them. Sequentially, a full
-    # PROJECT_RECAP_CAP run could block /recap for minutes with zero
-    # feedback; in parallel it's bounded by the single slowest call.
-    if to_regenerate:
-        with ThreadPoolExecutor(max_workers=len(to_regenerate)) as pool:
-            results = list(pool.map(_recap, to_regenerate))
-    else:
-        results = []
-
-    by_slug_signature = {slug: signature for slug, _s, _d, signature in to_regenerate}
-    for slug, display_name, recap_text in results:
+        recap_text = deterministic_project_recap(summarized)
         if recap_text:
-            _write_project_recap(slug, {
-                "recap_text": recap_text,
-                "generated_at": _iso(now),
-                "based_on": by_slug_signature[slug],
-            })
             recaps[display_name] = recap_text
-        else:
-            cached = _read_project_recap(slug)
-            if cached:
-                recaps[display_name] = cached["recap_text"]
 
     return recaps
 
@@ -1157,6 +1164,8 @@ def add_legacy_no_id_entries(data: list[dict], no_id_entries: list[LegacyEntry])
                 "summary_at": e.ended_at,
                 "pending_label": None,
                 "force_command": None,
+                "long_running_open": False,
+                "long_running_label": None,
                 "last_activity_valid": _is_plausible_ts(e.ended_at),
             }
         )
@@ -1203,14 +1212,15 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
     color-scheme: light dark;
     --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
     --card-bg: #fafafa; --accent: #3457d5;
-    --completed: #1a7f37; --in-progress: #9a6700; --blocked: #cf222e; --unknown: #57606a;
-    --completed-bg: #e9f7ee; --in-progress-bg: #fdf2e0; --blocked-bg: #fdecea; --unknown-bg: #eef0f2;
+    --completed: #1a7f37; --in-progress: #9a6700; --blocked: #cf222e; --unknown: #57606a; --active: #0969da;
+    --completed-bg: #e9f7ee; --in-progress-bg: #fdf2e0; --blocked-bg: #fdecea; --unknown-bg: #eef0f2; --active-bg: #ddf4ff;
   }}
   @media (prefers-color-scheme: dark) {{
     :root {{
       --bg: #14161a; --fg: #e6e6e6; --muted: #9a9a9a; --border: #2a2d33;
       --card-bg: #1b1e24; --accent: #7c9cff;
       --completed-bg: #16261c; --in-progress-bg: #2a2115; --blocked-bg: #2b1a1a; --unknown-bg: #202329;
+      --active: #58a6ff; --active-bg: #172a3a;
     }}
   }}
   * {{ box-sizing: border-box; }}
@@ -1270,6 +1280,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .preview-dot.in-progress {{ background: var(--in-progress); }}
   .preview-dot.blocked {{ background: var(--blocked); }}
   .preview-dot.unknown {{ background: var(--unknown); }}
+  .preview-dot.active {{ background: var(--active); }}
   .preview-title {{ flex: 1; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
            -webkit-box-orient: vertical; overflow: hidden; }}
   .preview-date {{ color: var(--muted); font-size: 0.74rem; white-space: nowrap; flex-shrink: 0; }}
@@ -1288,6 +1299,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .card.completed {{ border-left-color: var(--completed); }}
   .card.in-progress {{ border-left-color: var(--in-progress); }}
   .card.blocked {{ border-left-color: var(--blocked); }}
+  .card.active {{ border-left-color: var(--active); }}
   .card-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }}
   .card-title {{ font-size: 0.98rem; font-weight: 700; margin: 0; display: -webkit-box;
            -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
@@ -1299,6 +1311,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .badge.in-progress {{ color: var(--in-progress); background: var(--in-progress-bg); }}
   .badge.blocked {{ color: var(--blocked); background: var(--blocked-bg); }}
   .badge.unknown {{ color: var(--unknown); background: var(--unknown-bg); }}
+  .badge.active {{ color: var(--active); background: var(--active-bg); }}
 
   .card-summary {{ font-size: 0.9rem; line-height: 1.5; margin-bottom: 8px; max-width: 68ch; }}
   .card-next {{ font-size: 0.86rem; margin-bottom: 8px; }}
@@ -1355,10 +1368,11 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
     <summary>How summaries work</summary>
     <p>
       Dashboard data (this page, and the session records behind it) is stored
-      locally on this machine. Producing a session summary or project recap
-      runs a local <code>claude -p</code> call, which may send that session's
-      transcript content to your configured Claude model — this is the only
-      network activity anywhere in this pipeline.{exclusion_note}
+      locally on this machine. Producing a session summary runs a local
+      <code>claude -p</code> call, which may send up to 40,000 characters of
+      deterministically filtered session evidence to your configured Claude
+      model. Project recaps are assembled locally and make no additional model
+      calls. Summary generation is the only network activity in this pipeline.{exclusion_note}
     </p>
   </details>
 
@@ -1428,12 +1442,17 @@ function el(tag, opts) {{
   return e;
 }}
 
-function badgeClass(status) {{
+function badgeClass(session) {{
+  if (session.long_running_open) return "active";
   return {{
     "Completed": "completed",
     "In Progress": "in-progress",
     "Blocked": "blocked",
-  }}[status] || "unknown";
+  }}[session.status] || "unknown";
+}}
+
+function badgeLabel(session) {{
+  return session.long_running_open ? session.long_running_label : session.status;
 }}
 
 function escapeHtml(str) {{
@@ -1529,11 +1548,11 @@ function copyToClipboard(btn, text, doneLabel) {{
 
 function buildCard(s, opts) {{
   opts = opts || {{}};
-  const card = el("div", {{className: "card " + badgeClass(s.status)}});
+  const card = el("div", {{className: "card " + badgeClass(s)}});
 
   const head = el("div", {{className: "card-head"}});
   head.appendChild(el("h3", {{className: "card-title", text: s.title}}));
-  head.appendChild(el("span", {{className: "badge " + badgeClass(s.status), text: s.status}}));
+  head.appendChild(el("span", {{className: "badge " + badgeClass(s), text: badgeLabel(s)}}));
   card.appendChild(head);
 
   const meta = el("div", {{className: "card-meta"}});
@@ -1715,8 +1734,10 @@ function renderProjectGrid(filtered) {{
     card.appendChild(head);
 
     const latestValid = latestValidEndedAt(sessions);
+    const longRunning = sessions.find(s => s.long_running_open);
     card.appendChild(el("div", {{className: "project-card-activity",
-      text: latestValid ? `Last used ${{formatRelative(latestValid)}}` : "Date unavailable"}}));
+      text: longRunning ? longRunning.long_running_label :
+        (latestValid ? `Last used ${{formatRelative(latestValid)}}` : "Date unavailable")}}));
 
     const recap = PROJECT_RECAPS[project];
     if (recap) {{
@@ -1732,10 +1753,11 @@ function renderProjectGrid(filtered) {{
     const preview = el("div", {{className: "project-preview"}});
     for (const s of sessions.slice(0, 3)) {{
       const row = el("div", {{className: "preview-row"}});
-      row.appendChild(el("span", {{className: "preview-dot " + badgeClass(s.status)}}));
+      row.appendChild(el("span", {{className: "preview-dot " + badgeClass(s)}}));
       row.appendChild(el("span", {{className: "preview-title", text: s.title}}));
       row.appendChild(el("span", {{className: "preview-date",
-        text: s.last_activity_valid ? formatRelative(s.ended_at) : "Date unavailable"}}));
+        text: s.long_running_open ? s.long_running_label :
+          (s.last_activity_valid ? formatRelative(s.ended_at) : "Date unavailable")}}));
       preview.appendChild(row);
     }}
     card.appendChild(preview);

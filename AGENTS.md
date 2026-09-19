@@ -4,17 +4,18 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## What this is
 
-A local, cross-project work recap for Codex. Hooks record what happens in every Codex session (start, activity checkpoints, an evidence-based end-of-session summary), and `session_dashboard.py` renders it all into one static HTML dashboard: what's done, what's in progress or blocked, and a one-command way to resume any session. All data stays on this machine, but summaries and project recaps are produced by a real local `Codex -p` subprocess call, which sends that session's transcript to your configured Codex model — the dashboard's own privacy note states this rather than describing the pipeline as fully offline.
+A local, cross-project work recap for Codex. Hooks record what happens in every Codex session (start, activity checkpoints, an evidence-based end-of-session summary), and `session_dashboard.py` renders it all into one static HTML dashboard: what's done, what's in progress or blocked, and a one-command way to resume any session. All data stays on this machine. Session summaries use a real local `Codex -p` subprocess call after a deterministic pass has filtered and capped the evidence at 40,000 characters; project recaps are assembled locally from existing summaries and make no additional model calls.
 
 To leave a project out of the dashboard (and out of lazy summarization / project-recap generation) entirely, add its path — or a path prefix — to `~/.Codex/session-logs/recap-exclude.txt`, one per line, `#` comments allowed. Absent by default; nothing is excluded until this file exists.
 
-This repo is wired into one machine's `~/.Codex/` via symlinks: `~/.Codex/hooks/*` and `~/.Codex/scripts/session_*.py` point back into this repo. There is no build step, package manifest, or test suite — edit the files here and the symlinked live install picks up the change immediately.
+This repo is wired into one machine's `~/.Codex/` via symlinks: `~/.Codex/hooks/*` and `~/.Codex/scripts/session_*.py` point back into this repo. There is no build step or Python package manifest — edit the files here and the symlinked live install picks up the change immediately. Focused stdlib `unittest` coverage lives under `tests/`.
 
 ## Running / testing changes
 
 - Regenerate the dashboard by hand: `python3 scripts/session_dashboard.py` (prints the output path, `~/.Codex/session-logs/dashboard.html`).
+- Run the complete generate-and-open workflow used by `/recap`: `./scripts/recap.sh` (`RECAP_NO_OPEN=1` disables browser opening).
 - Force an immediate (non-lazy) resummarization of one session, bypassing the per-run cap and the "looks live" skip: `python3 scripts/session_dashboard.py --summarize-session <session_id>`.
-- There's no automated test suite. Verify hook changes by tailing real records under `~/.Codex/session-logs/<project-slug>/<session_id>.json` and comparing against the transcript at `~/.Codex/projects/<project-slug>/<session_id>.jsonl` after a live session start/stop/end.
+- Run the focused unit suite with `python3 -m unittest discover -s tests -v`. Verify hook changes end-to-end by tailing real records under `~/.Codex/session-logs/<project-slug>/<session_id>.json` and comparing against the transcript at `~/.Codex/projects/<project-slug>/<session_id>.jsonl` after a live session start/stop/end.
 - Only stdlib is used in the Python scripts (no dependencies to install).
 
 ## Architecture
@@ -37,7 +38,7 @@ All reads/writes to a record go through `session_record.py::merge_section`, whic
 
 ### Recursion guard for the summarizer sub-agent
 
-`session_summarize.py::run_bounded_summary` launches `Codex -p` as a detached subprocess to read a transcript and write a markdown summary. That subprocess is itself a full Codex session with its own hooks and its own transcript. Two independent mechanisms prevent it from recursively summarizing itself forever:
+`session_summarize.py::run_bounded_summary` first extracts a deterministic, at-most-40,000-character evidence document from the transcript, then launches `Codex -p` as a detached subprocess to read that bounded evidence and write a markdown summary. Thinking, attachments, metadata, oversized message bodies, and oversized tool output are never passed through. Each call also carries a $0.10 `--max-budget-usd` ceiling, configurable through `RECAP_SUMMARY_MAX_BUDGET_USD`. The evidence hash and prompt version are stored with the summary, so unchanged semantic input is a cache hit even if ignored transcript metadata grew. That subprocess is itself a full Codex session with its own hooks and its own transcript. Two independent mechanisms prevent it from recursively summarizing itself forever:
 
 1. `CLAUDE_SESSION_LOG_SUMMARIZER=1` is set in its env; every hook script checks this and exits immediately if set.
 2. It's always run from a dedicated scratch cwd (`~/.Codex/session-logs/.summarizer-scratch`), so its transcript lands under its own isolated `~/.Codex/projects/<scratch-slug>/` directory, which `session_dashboard.py` explicitly excludes from reconciliation (`SUMMARIZER_SCRATCH_SLUG`).
@@ -50,7 +51,9 @@ Both guards matter — the env var stops the hooks from writing a record, but on
 2. Legacy timestamp-named `*.md` files under `~/.Codex/session-logs/<slug>/` from before this JSON pipeline existed — still parsed (`parse_sections`/`LEGACY_SECTION_NAMES`) for history, deduped by `session_id` when present, and preferring a real summary over one still carrying the old placeholder marker (`LEGACY_PLACEHOLDER_MARKER`).
 3. Real transcripts under `~/.Codex/projects/<slug>/*.jsonl` — Codex's own ground truth. Any transcript with no record and no legacy entry at all (crashed/killed session, or a hook that never fired) gets a synthesized "orphan" entry via `reconcile_orphans` instead of silently vanishing — but only within `ORPHAN_RECONCILE_MAX_AGE_DAYS` (14 days), so this doesn't retroactively surface months of pre-existing history the first time the pipeline runs on a machine.
 
-On every run, `run_lazy_summarization` also backfills a real summary for up to `LAZY_SUMMARY_CAP` (5) sessions whose summary is missing or stale (`_needs_summary`), skipping anything that still looks actively in use (`_is_live`, activity within `LIVE_THRESHOLD_SECONDS` = 5 minutes). **Status is never inferred from a checkpoint's mere existence** — a session without a real summarizer-produced status always shows as "Unknown," honestly labeled with its last known activity, never guessed as "In Progress" or "Completed."
+On every run, `run_lazy_summarization` scans up to `LAZY_SUMMARY_SCAN_CAP` (20) recent sessions whose summary is missing or stale (`_needs_summary`), skipping anything that still looks actively in use (`_is_live`, activity within `LIVE_THRESHOLD_SECONDS` = 5 minutes). Cache hits only advance content coverage. Actual model work is limited to `MAX_SUMMARY_CALLS_PER_RUN` (2), runs sequentially, and cannot exceed `MAX_SUMMARY_INPUT_CHARS_PER_RUN` (80,000 characters) in total. **Status is never inferred from a checkpoint's mere existence** — a session without a real summarizer-produced status always shows as "Unknown," honestly labeled with its last known activity, never guessed as "In Progress" or "Completed."
+
+Open-session state is lifecycle-derived rather than model-derived: the latest `start._ts` (updated on resume while preserving the original `started_at`) must be newer than the latest `end` timestamp. An open session older than `LONG_RUNNING_OPEN_SECONDS` (2 hours) is retained and shown in project/session views as `Open for …`; this display marker does not overwrite the summary's semantic status.
 
 ### Dashboard HTML/JS is generated, not templated from files
 
@@ -64,4 +67,4 @@ The one `innerHTML` usage (`inlineFormat`) escapes user/session-derived text fir
 
 ### Project-level recap synthesis
 
-`run_project_recaps` groups sessions by project, takes each project's most recent already-summarized sessions (`PROJECT_RECAP_CANDIDATE_COUNT`, no new transcript read), and makes one bounded `Codex -p` call via `session_summarize.py::run_project_recap` to synthesize an at-most-two-sentence recap — explicitly told to call out unrelated threads rather than pretend a single narrative. Cached in `<slug>/project_recap.json`, regenerated only when the contributing session set/summaries (`based_on` signature) changes, capped per run (`PROJECT_RECAP_CAP`) the same way lazy session summarization is. A project with no real session summaries yet simply has no recap line.
+`run_project_recaps` groups sessions by project and deterministically assembles an at-most-two-sentence recap from each project's most recent already-summarized sessions (`PROJECT_RECAP_CANDIDATE_COUNT`, no new transcript read and no model call). It uses the latest distinct completed/worked-on facts and, when present, the latest required next action. A project with no real session summaries yet simply has no recap line.
