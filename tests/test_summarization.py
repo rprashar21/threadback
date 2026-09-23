@@ -63,6 +63,13 @@ class EvidenceExtractionTests(unittest.TestCase):
         self.assertIn("EVENT-39", bounded)
         self.assertIn("middle events omitted", bounded)
 
+    def test_prompt_requires_tagged_bullet_claims(self):
+        prompt = summarize.PROMPT_TEMPLATE
+        for tag in ("[Verified]", "[Discussed]", "[Uncertain]"):
+            self.assertIn(tag, prompt)
+        self.assertIn("one bullet per line", prompt)
+        self.assertIn("at most 5 bullets", prompt)
+
     def test_summary_cache_requires_hash_and_prompt_version(self):
         prepared = summarize.PreparedEvidence("evidence", "abc", 123)
         matching = {"prompt_version": summarize.PROMPT_VERSION, "evidence_hash": "abc"}
@@ -112,6 +119,66 @@ class EvidenceExtractionTests(unittest.TestCase):
 
         self.assertEqual(parsed["status"], "Completed")
         self.assertLessEqual(len(parsed["worked_on"]), summarize.MAX_SUMMARY_FIELD_CHARS)
+
+
+class LastUserPromptTests(unittest.TestCase):
+    def _write_transcript(self, records: list[dict]) -> Path:
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+        with tmp:
+            for record in records:
+                tmp.write(json.dumps(record) + "\n")
+        self.addCleanup(Path(tmp.name).unlink, missing_ok=True)
+        return Path(tmp.name)
+
+    def test_returns_last_real_user_text_not_tool_result_echo(self):
+        transcript = self._write_transcript([
+            {"type": "user", "turnOrigin": "human",
+             "message": {"content": "First question about caching."}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Sure."}]}},
+            {"type": "user", "turnOrigin": "human", "message": {"content": [
+                {"type": "tool_result", "content": "OK\n" + ("x" * 500)},
+            ]}},
+            {"type": "user", "turnOrigin": "human",
+             "message": {"content": "Now add some colors for better view??"}},
+        ])
+
+        result = dashboard._last_user_prompt(transcript)
+
+        self.assertEqual(result, "Now add some colors for better view??")
+
+    def test_clips_long_prompt_to_max_chars(self):
+        transcript = self._write_transcript([
+            {"type": "user", "turnOrigin": "human", "message": {"content": "y" * 500}},
+        ])
+
+        result = dashboard._last_user_prompt(transcript, max_chars=50)
+
+        self.assertLessEqual(len(result), 50)
+
+    def test_returns_none_when_no_user_text_present(self):
+        transcript = self._write_transcript([
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
+        ])
+
+        self.assertIsNone(dashboard._last_user_prompt(transcript))
+
+    def test_skips_harness_injected_turns_not_typed_by_a_human(self):
+        # A background-task completion notification and a skill-load block
+        # both land in the transcript as ordinary type="user" text records
+        # (not tool_result echoes), but neither is something the person
+        # typed — turnOrigin is how Claude Code itself distinguishes them.
+        transcript = self._write_transcript([
+            {"type": "user", "turnOrigin": "human",
+             "message": {"content": "Add some colors for better view??"}},
+            {"type": "user", "isMeta": True,
+             "message": {"content": "Base directory for this skill: ..."}},
+            {"type": "user", "turnOrigin": "task_notification",
+             "message": {"content": "<task-notification>...finished</task-notification>"}},
+        ])
+
+        result = dashboard._last_user_prompt(transcript)
+
+        self.assertEqual(result, "Add some colors for better view??")
 
 
 class DeterministicProjectRecapTests(unittest.TestCase):

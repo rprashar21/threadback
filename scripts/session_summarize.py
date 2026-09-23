@@ -27,7 +27,7 @@ import session_record as sr  # noqa: E402
 
 SECTION_NAMES = ["Status", "Worked On", "Completed", "Stopped At", "Next Action"]
 VALID_STATUSES = {"Completed", "In Progress", "Blocked", "Unknown"}
-PROMPT_VERSION = "session-summary-v2-bounded-evidence"
+PROMPT_VERSION = "session-summary-v3-tagged-bullets"
 
 # The model never receives the raw transcript. A deterministic local pass keeps
 # only evidence-bearing events and enforces both per-event and whole-input caps.
@@ -164,17 +164,20 @@ PROMPT_TEMPLATE = (
     "this rather than guessing — do not default to In Progress or Completed when the "
     "evidence is unclear. "
     "\n\n"
-    "In 'Worked On' and 'Completed', classify each concrete claim as one of three "
-    "kinds, and say which: "
-    "(1) verified — actually implemented/done, with a file edited, a command that ran "
+    "In 'Worked On' and 'Completed', write one bullet per line, each starting with "
+    "'- ', at most 5 bullets per section, one clause per bullet — no paragraphs, no "
+    "multi-claim bullets. Each bullet must start with exactly one of these three tags, "
+    "and say which applies: "
+    "'[Verified]' — actually implemented/done, with a file edited, a command that ran "
     "and succeeded, or a result you can see confirmed in the transcript; state it as "
-    "done, and add a short evidence pointer in parentheses (a file path, the command, "
-    "or the test/result) right after the claim; "
-    "(2) discussed — only proposed, suggested, or planned, never say 'implemented' or "
-    "'completed' for these, say 'discussed' or 'planned' instead; "
-    "(3) uncertain — you cannot tell from the transcript whether it actually happened "
+    "done, and end the bullet with a short evidence pointer in parentheses (a file "
+    "path, the command, or the test/result); "
+    "'[Discussed]' — only proposed, suggested, or planned, never say 'implemented' or "
+    "'completed' for these; "
+    "'[Uncertain]' — you cannot tell from the transcript whether it actually happened "
     "(e.g. a tool call's result was cut off, ambiguous, or never shown) — say so "
-    "explicitly ('unclear whether this succeeded') rather than guessing either way. "
+    "explicitly rather than guessing either way. "
+    "Example bullet: '- [Verified] Added the retry helper (src/retry.py)'. "
     "\n\n"
     "In 'Next Action': if the requested task is fully done, write exactly 'No required "
     "next action.' Never state an optional idea or suggestion as if it were required — "

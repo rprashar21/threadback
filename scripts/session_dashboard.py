@@ -624,6 +624,51 @@ def scan_transcript_usage(path: Path) -> dict | None:
     return {"peak_context_tokens": peak, "total_output_tokens": total_output}
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _last_user_prompt(path: Path, max_chars: int = 200) -> str | None:
+    """Best-effort, zero-model-call peek at the last thing the user actually
+    typed — for a live session that's too fresh to run the real summarizer
+    on (see _is_live). Streams the transcript same as scan_transcript_usage
+    (no whole-file read); reuses ss._text_blocks to skip tool_result echoes
+    that Claude Code also logs under type "user". Returns None, never a
+    guess, if no real user text is found."""
+    last_text = None
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "user":
+                    continue
+                # Claude Code also logs harness-injected turns (a background
+                # task-completion notification, a skill's loaded body) as
+                # ordinary type="user" text — not just tool_result echoes.
+                # turnOrigin is the structural field it uses to mark a turn
+                # as actually typed by the person; anything else (missing,
+                # "task_notification", etc.) is not a real prompt to show.
+                if d.get("turnOrigin") != "human":
+                    continue
+                content = (d.get("message") or {}).get("content")
+                for value in ss._text_blocks(content):
+                    if value.strip():
+                        last_text = value
+    except OSError:
+        return None
+    if last_text is None:
+        return None
+    normalized = _WHITESPACE_RE.sub(" ", last_text).strip()
+    if not normalized:
+        return None
+    return ss._clip(normalized, max_chars)
+
+
 def get_usage_stats(c: Combined) -> dict | None:
     """Cached, transcript-mtime-gated context-usage numbers for one session
     — recomputed only when the transcript has grown since it was last
@@ -975,6 +1020,7 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
             summary = make_summary(worked_on, completed)
             title = make_title(summary, worked_on, project)
             pending_label = None
+            last_prompt = None
         else:
             status = "Unknown"
             worked_on = "Not yet summarized."
@@ -987,8 +1033,14 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
             title = f"{project} session"
             if _is_live(c, now):
                 pending_label = "Looks active right now — skipped this run."
+                last_prompt = (
+                    _last_user_prompt(c.transcript_path)
+                    if c.transcript_path is not None
+                    else None
+                )
             else:
                 pending_label = "Queued — will summarize on a later /recap run."
+                last_prompt = None
 
         next_required, next_optional = split_next_action(status, next_action_text)
 
@@ -1023,6 +1075,7 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
                 "summary_source": summary_source,
                 "summary_at": summary_at,
                 "pending_label": pending_label,
+                "last_prompt": last_prompt,
                 "force_command": force_command,
                 "long_running_open": long_running_label is not None,
                 "long_running_label": long_running_label,
@@ -1296,22 +1349,27 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
 
   .card {{ background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid var(--unknown);
            border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }}
-  .card.completed {{ border-left-color: var(--completed); }}
-  .card.in-progress {{ border-left-color: var(--in-progress); }}
-  .card.blocked {{ border-left-color: var(--blocked); }}
-  .card.active {{ border-left-color: var(--active); }}
+  .card.completed {{ border-left-color: var(--completed); background: var(--completed-bg); }}
+  .card.in-progress {{ border-left-color: var(--in-progress); background: var(--in-progress-bg); }}
+  .card.blocked {{ border-left-color: var(--blocked); background: var(--blocked-bg); }}
+  .card.unknown {{ background: var(--unknown-bg); }}
+  .card.active {{ border-left-color: var(--active); background: var(--active-bg); }}
   .card-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }}
   .card-title {{ font-size: 0.98rem; font-weight: 700; margin: 0; display: -webkit-box;
            -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
   .card-meta {{ display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; color: var(--muted);
            font-size: 0.78rem; margin-bottom: 8px; }}
-  .card-meta .project-chip {{ font-weight: 600; color: var(--fg); }}
+  .card-meta .project-chip {{ font-weight: 600; padding: 2px 8px; border-radius: 6px;
+           color: hsl(var(--chip-hue) 65% 32%); background: hsl(var(--chip-hue) 65% 32% / 14%); }}
+  @media (prefers-color-scheme: dark) {{
+    .card-meta .project-chip {{ color: hsl(var(--chip-hue) 65% 72%); background: hsl(var(--chip-hue) 65% 72% / 16%); }}
+  }}
   .badge {{ font-size: 0.72rem; font-weight: 600; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }}
-  .badge.completed {{ color: var(--completed); background: var(--completed-bg); }}
-  .badge.in-progress {{ color: var(--in-progress); background: var(--in-progress-bg); }}
-  .badge.blocked {{ color: var(--blocked); background: var(--blocked-bg); }}
-  .badge.unknown {{ color: var(--unknown); background: var(--unknown-bg); }}
-  .badge.active {{ color: var(--active); background: var(--active-bg); }}
+  .badge.completed {{ color: #fff; background: var(--completed); }}
+  .badge.in-progress {{ color: #fff; background: var(--in-progress); }}
+  .badge.blocked {{ color: #fff; background: var(--blocked); }}
+  .badge.unknown {{ color: #fff; background: var(--unknown); }}
+  .badge.active {{ color: #fff; background: var(--active); }}
 
   .card-summary {{ font-size: 0.9rem; line-height: 1.5; margin-bottom: 8px; max-width: 68ch; }}
   .card-next {{ font-size: 0.86rem; margin-bottom: 8px; }}
@@ -1320,6 +1378,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .card-next.no-action {{ color: var(--muted); font-style: italic; }}
   .card-provenance {{ font-size: 0.74rem; color: var(--muted); margin-bottom: 10px; }}
   .card-pending {{ font-size: 0.8rem; color: var(--unknown); font-style: italic; margin-bottom: 10px; }}
+  .card-last-prompt {{ font-size: 0.8rem; color: var(--muted); margin-bottom: 10px; }}
 
   .card-actions {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
   .btn {{ border-radius: 6px; padding: 6px 12px; font-size: 0.8rem; cursor: pointer; border: 1px solid transparent; }}
@@ -1337,6 +1396,13 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   ul.field-list {{ margin: 0; padding-left: 1.2em; }}
   ul.field-list li {{ margin-bottom: 4px; }}
   ul.field-list li:last-child {{ margin-bottom: 0; }}
+  ul.field-list li {{ list-style: none; }}
+  .claim-tag {{ display: inline-block; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+           letter-spacing: 0.03em; padding: 1px 7px; border-radius: 999px; margin-right: 6px; vertical-align: middle; }}
+  .claim-tag.verified {{ color: var(--completed); background: var(--completed-bg); }}
+  .claim-tag.discussed {{ color: var(--in-progress); background: var(--in-progress-bg); }}
+  .claim-tag.uncertain {{ color: var(--unknown); background: var(--unknown-bg); }}
+  .claim-evidence {{ display: block; font-size: 0.78rem; color: var(--muted); margin: 2px 0 0 2px; }}
   .field code, .field-text code, code.resume {{ background: rgba(127,127,127,0.15); padding: 1px 5px; border-radius: 4px;
            font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
   code.resume {{ display: block; padding: 8px 10px; overflow-x: auto; white-space: nowrap; user-select: all; }}
@@ -1442,6 +1508,16 @@ function el(tag, opts) {{
   return e;
 }}
 
+// Deterministic hash of a project name to a stable 0-359 hue, so the same
+// project always gets the same chip color across renders and machines.
+function projectHue(name) {{
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {{
+    hash = (hash * 31 + name.charCodeAt(i)) | 0;
+  }}
+  return Math.abs(hash) % 360;
+}}
+
 function badgeClass(session) {{
   if (session.long_running_open) return "active";
   return {{
@@ -1468,16 +1544,57 @@ function inlineFormat(str) {{
   return escapeHtml(str).replace(/`([^`]+)`/g, "<code>$1</code>");
 }}
 
+const CLAIM_TAGS = {{
+  "[Verified]": {{className: "verified", label: "Verified"}},
+  "[Discussed]": {{className: "discussed", label: "Discussed"}},
+  "[Uncertain]": {{className: "uncertain", label: "Uncertain"}},
+}};
+
+// Splits a trailing "(...)" evidence pointer off a claim bullet so it can be
+// rendered as a separate muted sub-line instead of sitting mid-sentence.
+function splitEvidence(text) {{
+  const m = text.match(/^(.*\\S)\\s*\\(([^()]+)\\)\\s*$/);
+  if (!m) return {{claim: text, evidence: null}};
+  return {{claim: m[1], evidence: m[2]}};
+}}
+
+function renderClaimBullet(li, line) {{
+  let rest = line;
+  let tag = null;
+  for (const prefix of Object.keys(CLAIM_TAGS)) {{
+    if (rest.startsWith(prefix)) {{
+      tag = CLAIM_TAGS[prefix];
+      rest = rest.slice(prefix.length).trim();
+      break;
+    }}
+  }}
+  const {{claim, evidence}} = splitEvidence(rest);
+  if (tag) {{
+    li.appendChild(el("span", {{className: "claim-tag " + tag.className, text: tag.label}}));
+  }}
+  const claimSpan = document.createElement("span");
+  claimSpan.innerHTML = inlineFormat(claim);
+  li.appendChild(claimSpan);
+  if (evidence) {{
+    li.appendChild(el("span", {{className: "claim-evidence", text: evidence}}));
+  }}
+}}
+
 function renderField(container, label, value) {{
   const f = el("div", {{className: "field"}});
   f.appendChild(el("span", {{className: "k", text: label}}));
   const lines = value.split("\\n").map(l => l.trim()).filter(l => l.length > 0);
-  const isList = lines.length > 1 && lines.every(l => l.startsWith("- ") || l.startsWith("* "));
+  const isList = lines.length > 1 && lines.some(l => l.startsWith("- ") || l.startsWith("* "));
   if (isList) {{
     const ul = el("ul", {{className: "field-list"}});
     for (const line of lines) {{
       const li = document.createElement("li");
-      li.innerHTML = inlineFormat(line.slice(2));
+      const isBullet = line.startsWith("- ") || line.startsWith("* ");
+      if (isBullet) {{
+        renderClaimBullet(li, line.slice(2).trim());
+      }} else {{
+        li.innerHTML = inlineFormat(line);
+      }}
       ul.appendChild(li);
     }}
     f.appendChild(ul);
@@ -1557,7 +1674,9 @@ function buildCard(s, opts) {{
 
   const meta = el("div", {{className: "card-meta"}});
   if (opts.showProject) {{
-    meta.appendChild(el("span", {{className: "project-chip", text: s.project}}));
+    const chip = el("span", {{className: "project-chip", text: s.project}});
+    chip.style.setProperty("--chip-hue", String(projectHue(s.project)));
+    meta.appendChild(chip);
   }}
   const when = el("span", {{text: s.last_activity_valid ? formatFriendlyDate(s.ended_at) : "Date unavailable"}});
   if (s.last_activity_valid) when.title = s.ended_at;
@@ -1572,6 +1691,11 @@ function buildCard(s, opts) {{
       text: `Summary: ${{label}} · ${{formatRelative(s.summary_at || s.ended_at)}}`}}));
   }} else if (s.pending_label) {{
     card.appendChild(el("div", {{className: "card-pending", text: s.pending_label}}));
+  }}
+
+  if (s.last_prompt) {{
+    card.appendChild(el("div", {{className: "card-last-prompt",
+      text: `Last prompt: "${{s.last_prompt}}"`}}));
   }}
 
   if (s.summary_source) {{
