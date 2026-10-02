@@ -12,8 +12,5 @@ __pycache__/
 venv/
 .venv/
 
-# npm installer: vendored copy of hooks/scripts, rebuilt by npx/scripts/prepack.js
-npx/vendor/
-npx/node_modules/
 /prompts/improvements.md
 prompts/
