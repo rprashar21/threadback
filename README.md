@@ -47,13 +47,12 @@ scripts/   session_record.py    — concurrency-safe per-session JSON records
            session_summarize.py — bounded, one-shot LLM summarization
            session_dashboard.py — generates the dashboard.html
 commands/  recap.md — /recap slash command (plugin install only)
-npx/       standalone installer, published separately (see below)
 .claude-plugin/  plugin.json + marketplace.json (self-hosted single-plugin marketplace)
 ```
 
 ## Installing
 
-### Option A: as a Claude Code plugin (recommended)
+### As a Claude Code plugin
 
 ```
 claude plugin marketplace add rprashar21/threadback
@@ -92,24 +91,14 @@ Existing session records under `~/.claude/session-logs/` are left in place.
 **Requirements:** `python3` (stdlib only), `bash`, and the `claude` CLI on
 your `PATH` (used for session summaries).
 
-Do not combine Option A with Option B or C on the same machine. The hooks
-would be registered twice and every session would be recorded twice.
+Do not combine the plugin with the manual symlink setup below on the same
+machine. The hooks would be registered twice and every session would be
+recorded twice.
 
-### Option B: npx installer
-
-```
-npx @8thlight/recap-dashboard-install
-```
-
-Copies `hooks/` and `scripts/` into `~/.claude-recap-dashboard/` and merges
-the three hook entries into `~/.claude/settings.json` (existing hooks and
-other settings are left untouched; safe to re-run). See `npx/` for the
-installer source.
-
-### Option C: manual symlink (this repo's own dev setup)
+### Development setup: manual symlinks
 
 This repo's own development machine is wired into `~/.claude/` via manual
 symlinks (`~/.claude/hooks/*` and `~/.claude/scripts/session_*.py` point back
-into this repo) instead of using either installer above, so that editing
+into this repo) instead of using the plugin, so that editing
 files here takes effect immediately. Only worth doing if you're actively
 developing this tool itself.
