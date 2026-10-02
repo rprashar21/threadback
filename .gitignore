@@ -16,3 +16,4 @@ venv/
 npx/vendor/
 npx/node_modules/
 /prompts/improvements.md
+prompts/
