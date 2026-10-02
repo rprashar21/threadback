@@ -61,7 +61,39 @@ claude plugin install threadback@threadback
 ```
 
 This registers the `SessionStart`/`Stop`/`SessionEnd` hooks and the `/recap`
-slash command automatically — no manual editing of `~/.claude/settings.json`.
+slash command automatically. No manual editing of `~/.claude/settings.json`.
+
+Restart Claude Code after installing, since hooks load at session start. Then
+run `/recap` to generate and open the dashboard.
+
+**Verify:** `claude plugin list` should show `threadback@threadback` at the
+current version (see `.claude-plugin/plugin.json`).
+
+**Update to the latest version:**
+
+```
+claude plugin marketplace update threadback
+claude plugin update threadback@threadback
+```
+
+Restart Claude Code afterwards. Updates are keyed on the `version` in
+`plugin.json`, so maintainers must bump it with every release or installed
+copies will not update.
+
+**Uninstall:**
+
+```
+claude plugin uninstall threadback@threadback
+claude plugin marketplace remove threadback
+```
+
+Existing session records under `~/.claude/session-logs/` are left in place.
+
+**Requirements:** `python3` (stdlib only), `bash`, and the `claude` CLI on
+your `PATH` (used for session summaries).
+
+Do not combine Option A with Option B or C on the same machine. The hooks
+would be registered twice and every session would be recorded twice.
 
 ### Option B: npx installer
 
