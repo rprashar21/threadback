@@ -17,6 +17,8 @@ at most 80,000 evidence characters in aggregate, and gives each `claude -p`
 call a $0.10 hard budget ceiling. Override the per-call ceiling with the
 `RECAP_SUMMARY_MAX_BUDGET_USD` environment variable.
 
+Open sessions show a live snapshot (last prompt, latest reply, recent tools and files) with no model call. To also refresh their summaries in the background while they run, set `RECAP_LIVE_SUMMARY=1`. Refreshes only fire after about 60 KB of new transcript and at most every 20 minutes, up to 6 per session. Tune with `RECAP_LIVE_MIN_BYTES`, `RECAP_LIVE_MIN_MINUTES` and `RECAP_LIVE_MAX_REFRESHES`.
+
 ## Requirements
 
 - macOS or Linux. The record-locking (`fcntl`) this relies on is POSIX-only — **Windows is not supported**.

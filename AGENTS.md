@@ -65,6 +65,13 @@ The one `innerHTML` usage (`inlineFormat`) escapes user/session-derived text fir
 
 `scan_transcript_usage` reads a transcript's own per-turn `usage` blocks (already present in every real Codex transcript) to compute two *distinct* numbers, never conflated: `peak_context_tokens` (the highest `input + cache_creation_input + cache_read_input` seen on any one turn) and `total_output_tokens` (summed `output_tokens` across all turns). No LLM call is involved. Results are cached per session in a `usage` record section, gated by transcript `mtime` the same way `checkpoint` is, so a full transcript rescan only happens when the transcript has actually grown. A transcript with no `usage` blocks at all yields `None` for both fields — the UI omits the metric rather than guessing.
 
+### Live view of open sessions
+
+Two layers, both non-blocking:
+
+- **Snapshot (always on, no model call):** for each open session `scan_live_snapshot` reads only the last 64 KB of the transcript (last typed prompt, last assistant text, recent tool counts, recently edited files). Cards show `Live` (activity under 5 minutes), `Open, idle Xm`, or the existing `Open for …`. A summary older than the transcript is labelled "behind" rather than shown as current.
+- **Background refresh (opt-in, `RECAP_LIVE_SUMMARY=1`):** the Stop-hook checkpoint now runs `session_record.py live-tick`, which merges the checkpoint and, only when every gate passes, spawns `hooks/session-live-worker.sh` detached. Gates: transcript grew at least 60 KB since `summarized_through_bytes` (`RECAP_LIVE_MIN_BYTES`), at least 20 minutes since the last attempt (`RECAP_LIVE_MIN_MINUTES`), at most 6 attempts per session (`RECAP_LIVE_MAX_REFRESHES`), no in-flight lock, project not opted out. The worker calls `run_bounded_summary(..., "live")`, so the usual 40,000-character evidence cap, hash cache and per-call budget apply, and the end-of-session summary wins on coverage.
+
 ### Project-level recap synthesis
 
 `run_project_recaps` groups sessions by project and deterministically assembles an at-most-two-sentence recap from each project's most recent already-summarized sessions (`PROJECT_RECAP_CANDIDATE_COUNT`, no new transcript read and no model call). It uses the latest distinct completed/worked-on facts and, when present, the latest required next action. A project with no real session summaries yet simply has no recap line.

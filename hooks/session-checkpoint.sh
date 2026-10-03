@@ -34,6 +34,10 @@ if [ -z "$PROJECT_SLUG" ]; then
   exit 0
 fi
 
+if python3 "$RECORD_HELPER" opted-out "$CWD" 2>/dev/null; then
+  exit 0
+fi
+
 TRANSCRIPT_BYTES=$(stat -f%z "$TRANSCRIPT_PATH" 2>/dev/null || stat -c%s "$TRANSCRIPT_PATH" 2>/dev/null || echo 0)
 TRANSCRIPT_MTIME_EPOCH=$(stat -f%m "$TRANSCRIPT_PATH" 2>/dev/null || stat -c%Y "$TRANSCRIPT_PATH" 2>/dev/null || echo 0)
 CHECKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -41,10 +45,11 @@ TRANSCRIPT_MTIME="$(python3 -c 'import datetime,sys; print(datetime.datetime.utc
 
 DATA="$(python3 -c 'import json,sys; print(json.dumps({"checked_at": sys.argv[1], "transcript_bytes": int(sys.argv[2]), "transcript_mtime": sys.argv[3]}))' "$CHECKED_AT" "$TRANSCRIPT_BYTES" "$TRANSCRIPT_MTIME")"
 
-if ! MERGE_ERR="$(python3 "$RECORD_HELPER" merge-section \
+if ! MERGE_ERR="$(python3 "$RECORD_HELPER" live-tick \
   --project-slug="$PROJECT_SLUG" \
   --session-id="$SESSION_ID" \
-  --section="checkpoint" \
+  --cwd="$CWD" \
+  --transcript-path="$TRANSCRIPT_PATH" \
   --data="$DATA" \
   --event-ts="$CHECKED_AT" \
   2>&1 1>/dev/null)"; then

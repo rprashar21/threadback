@@ -58,6 +58,110 @@ def slugify_cwd(cwd: str) -> str:
     return _NON_ALNUM_RE.sub("-", cwd)
 
 
+# A project opts out of the recap by containing `<cwd>/.claude/recap.json`
+# with {"exclude": true}. Nothing is deleted: existing records stay on disk
+# and reappear as soon as the flag is removed or set to false. Only the
+# session's exact cwd is checked (not its parents), so the rule stays
+# predictable.
+OPT_OUT_RELPATH = Path(".claude") / "recap.json"
+
+
+def project_opted_out(cwd: str | None) -> bool:
+    if not cwd:
+        return False
+    try:
+        config = json.loads((Path(cwd) / OPT_OUT_RELPATH).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(config, dict) and config.get("exclude") is True
+
+
+# --- Live (mid-session) summary gating ---------------------------------------
+# Opt-in via RECAP_LIVE_SUMMARY=1. The Stop hook calls `live-tick`, which
+# merges the checkpoint and, only when every gate below passes, spawns a
+# detached worker to summarize the still-open session. Gates fire on real
+# work (bytes and time), not on message counts, so chatty-but-small sessions
+# cost nothing.
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+LIVE_LOCK_STALE_SECONDS = 300
+
+
+def live_enabled() -> bool:
+    return os.environ.get("RECAP_LIVE_SUMMARY") == "1"
+
+
+def live_refresh_due(record: dict, transcript_bytes: int, now_epoch: float) -> bool:
+    """Pure gate decision (no I/O) so it is easy to test."""
+    min_growth = _env_int("RECAP_LIVE_MIN_BYTES", 60 * 1024)
+    min_interval = _env_int("RECAP_LIVE_MIN_MINUTES", 20) * 60
+    max_refreshes = _env_int("RECAP_LIVE_MAX_REFRESHES", 6)
+
+    covered = record.get("summary", {}).get("summarized_through_bytes", 0)
+    if not isinstance(covered, int) or transcript_bytes - covered < min_growth:
+        return False
+    live = record.get("live", {})
+    if live.get("attempts", 0) >= max_refreshes:
+        return False
+    if now_epoch - live.get("attempted_epoch", 0) < min_interval:
+        return False
+    return True
+
+
+def _acquire_live_lock(lock: Path, now_epoch: float) -> bool:
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            if now_epoch - lock.stat().st_mtime < LIVE_LOCK_STALE_SECONDS:
+                return False
+            lock.unlink()
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            return False
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def live_tick(project_slug: str, session_id: str, cwd: str, transcript_path: str,
+              checkpoint: dict, event_ts: str) -> str:
+    """Merge the checkpoint, then maybe spawn the live worker. Returns a
+    short status word. Never raises for gate failures."""
+    import subprocess
+    import time
+
+    merge_section(project_slug, session_id, "checkpoint", checkpoint, event_ts)
+    if not live_enabled() or project_opted_out(cwd):
+        return "checkpoint-only"
+    record = read_record(project_slug, session_id)
+    now_epoch = time.time()
+    if not live_refresh_due(record, int(checkpoint.get("transcript_bytes", 0)), now_epoch):
+        return "not-due"
+    lock = LOG_ROOT / project_slug / f".{session_id}.live-lock"
+    if not _acquire_live_lock(lock, now_epoch):
+        return "in-flight"
+    attempts = record.get("live", {}).get("attempts", 0) + 1
+    merge_section(project_slug, session_id, "live",
+                  {"attempts": attempts, "attempted_epoch": now_epoch}, event_ts)
+    worker = Path(__file__).resolve().parent.parent / "hooks" / "session-live-worker.sh"
+    subprocess.Popen(
+        ["bash", str(worker), transcript_path, project_slug, session_id, cwd, str(lock)],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    return "spawned"
+
+
 # record_path() joins these two values straight into a filesystem path.
 # slugify_cwd() already guarantees project_slug never contains anything but
 # alphanumerics/hyphens, but session_id reaches merge_section() straight from
@@ -169,7 +273,30 @@ def _cli() -> int:
     p_slug = sub.add_parser("slugify")
     p_slug.add_argument("cwd")
 
+    p_opt = sub.add_parser("opted-out", help="exit 0 if the project opted out")
+    p_opt.add_argument("cwd")
+
+    p_tick = sub.add_parser("live-tick")
+    p_tick.add_argument("--project-slug", required=True)
+    p_tick.add_argument("--session-id", required=True)
+    p_tick.add_argument("--cwd", required=True)
+    p_tick.add_argument("--transcript-path", required=True)
+    p_tick.add_argument("--data", required=True, help="checkpoint JSON object string")
+    p_tick.add_argument("--event-ts", required=True)
+
     args = parser.parse_args()
+
+    if args.action == "live-tick":
+        try:
+            print(live_tick(args.project_slug, args.session_id, args.cwd,
+                            args.transcript_path, json.loads(args.data), args.event_ts))
+        except (ValueError, OSError) as e:
+            print(f"rejected: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.action == "opted-out":
+        return 0 if project_opted_out(args.cwd) else 1
 
     if args.action == "slugify":
         print(slugify_cwd(args.cwd))

@@ -282,3 +282,132 @@ class ActiveSessionDisplayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectOptOutTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.project = Path(self._tmp.name) / "proj"
+        (self.project / ".claude").mkdir(parents=True)
+        dashboard._OPT_OUT_CACHE.clear()
+        self.addCleanup(dashboard._OPT_OUT_CACHE.clear)
+
+    def _write_flag(self, text: str):
+        (self.project / ".claude" / "recap.json").write_text(text)
+
+    def test_flag_true_opts_out_and_removal_restores(self):
+        self.assertFalse(dashboard.sr.project_opted_out(str(self.project)))
+        self._write_flag('{"exclude": true}')
+        self.assertTrue(dashboard.sr.project_opted_out(str(self.project)))
+        self._write_flag('{"exclude": false}')
+        self.assertFalse(dashboard.sr.project_opted_out(str(self.project)))
+
+    def test_invalid_or_non_boolean_flag_does_not_opt_out(self):
+        for text in ("not json", '{"exclude": "yes"}', "[]"):
+            self._write_flag(text)
+            self.assertFalse(dashboard.sr.project_opted_out(str(self.project)))
+
+    def test_dashboard_hides_slug_whose_record_cwd_opted_out(self):
+        self._write_flag('{"exclude": true}')
+        slug = dashboard.sr.slugify_cwd(str(self.project))
+        log_root = Path(self._tmp.name) / "logs"
+        (log_root / slug).mkdir(parents=True)
+        (log_root / slug / "abc.json").write_text(
+            json.dumps({"start": {"cwd": str(self.project)}})
+        )
+        with mock.patch.object(dashboard, "LOG_ROOT", log_root):
+            self.assertTrue(dashboard._is_excluded_slug(slug))
+            dashboard._OPT_OUT_CACHE.clear()
+            self._write_flag('{"exclude": false}')
+            self.assertFalse(dashboard._is_excluded_slug(slug))
+
+
+class LiveSnapshotTests(unittest.TestCase):
+    def _transcript(self, records, pad=0):
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+        with tmp:
+            if pad:
+                tmp.write(json.dumps({"type": "system", "pad": "x" * pad}) + "\n")
+            for record in records:
+                tmp.write(json.dumps(record) + "\n")
+        self.addCleanup(Path(tmp.name).unlink, missing_ok=True)
+        return Path(tmp.name)
+
+    def test_extracts_prompt_latest_tools_and_files(self):
+        path = self._transcript([
+            {"type": "user", "turnOrigin": "human", "message": {"content": "Fix the cache"}},
+            {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Looking at it now."},
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "/a/b/cache.py"}},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            ]}},
+        ])
+        snap = dashboard.scan_live_snapshot(path)
+        self.assertEqual(snap["prompt"], "Fix the cache")
+        self.assertEqual(snap["latest"], "Looking at it now.")
+        self.assertEqual(snap["tools"], {"Edit": 1, "Bash": 1})
+        self.assertEqual(snap["files"], ["cache.py"])
+
+    def test_only_reads_the_tail(self):
+        path = self._transcript(
+            [{"type": "user", "turnOrigin": "human", "message": {"content": "recent"}}],
+            pad=5_000,
+        )
+        snap = dashboard.scan_live_snapshot(path, tail_bytes=1_000)
+        self.assertEqual(snap["prompt"], "recent")
+
+    def test_empty_tail_returns_none(self):
+        self.assertIsNone(dashboard.scan_live_snapshot(self._transcript([])))
+
+
+class LiveGateTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict("os.environ", {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sr = dashboard.sr
+
+    def test_requires_growth_since_summary(self):
+        record = {"summary": {"summarized_through_bytes": 100_000}}
+        self.assertFalse(self.sr.live_refresh_due(record, 100_000 + 1024, 1e9))
+        self.assertTrue(self.sr.live_refresh_due(record, 100_000 + 61 * 1024, 1e9))
+
+    def test_interval_and_attempt_cap(self):
+        base = {"summary": {"summarized_through_bytes": 0}}
+        big = 200 * 1024
+        recent = dict(base, live={"attempts": 1, "attempted_epoch": 1e9 - 60})
+        self.assertFalse(self.sr.live_refresh_due(recent, big, 1e9))
+        old = dict(base, live={"attempts": 1, "attempted_epoch": 1e9 - 3600})
+        self.assertTrue(self.sr.live_refresh_due(old, big, 1e9))
+        capped = dict(base, live={"attempts": 6, "attempted_epoch": 0})
+        self.assertFalse(self.sr.live_refresh_due(capped, big, 1e9))
+
+    def test_lock_blocks_until_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp) / ".sid.live-lock"
+            self.assertTrue(self.sr._acquire_live_lock(lock, 1e12))
+            now = lock.stat().st_mtime
+            self.assertFalse(self.sr._acquire_live_lock(lock, now + 10))
+            self.assertTrue(self.sr._acquire_live_lock(lock, now + 10_000))
+
+    def test_tick_is_checkpoint_only_when_disabled_and_spawns_when_due(self):
+        sr = self.sr
+        cp = {"checked_at": "t", "transcript_bytes": 500_000, "transcript_mtime": "t"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(sr, "LOG_ROOT", Path(tmp)), \
+                mock.patch("subprocess.Popen") as popen:
+            (Path(tmp) / "slug").mkdir()
+            with mock.patch.dict("os.environ", {"RECAP_LIVE_SUMMARY": "0"}):
+                self.assertEqual(
+                    sr.live_tick("slug", "sid1", tmp, "/t.jsonl", cp, "2026-01-01T00:00:00Z"),
+                    "checkpoint-only")
+            popen.assert_not_called()
+            with mock.patch.dict("os.environ", {"RECAP_LIVE_SUMMARY": "1"}):
+                self.assertEqual(
+                    sr.live_tick("slug", "sid1", tmp, "/t.jsonl", cp, "2026-01-01T00:00:01Z"),
+                    "spawned")
+                popen.assert_called_once()
+                self.assertEqual(
+                    sr.live_tick("slug", "sid1", tmp, "/t.jsonl", cp, "2026-01-01T00:00:02Z"),
+                    "not-due")

@@ -77,6 +77,10 @@ if [ -z "$PROJECT_SLUG" ]; then
   exit 0
 fi
 
+if python3 "$RECORD_HELPER" opted-out "$CWD" 2>/dev/null; then
+  exit 0
+fi
+
 ENDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # Fast, deterministic fact — not a status guess. Written synchronously so it

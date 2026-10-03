@@ -80,8 +80,40 @@ def load_excluded_prefixes() -> list[str]:
 EXCLUDED_PREFIXES = load_excluded_prefixes()
 
 
+_OPT_OUT_CACHE: dict[str, bool] = {}
+
+
+def _slug_cwd(slug: str) -> str | None:
+    """Best-effort real cwd for a project slug (slugs are lossy, so it has
+    to come from a record or a transcript)."""
+    for json_file in sorted((LOG_ROOT / slug).glob("*.json")):
+        if json_file.name.startswith("."):
+            continue
+        try:
+            record = json.loads(json_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for section in ("end", "start"):
+            cwd = record.get(section, {}).get("cwd") if isinstance(record, dict) else None
+            if cwd:
+                return cwd
+    for jsonl_file in sorted((PROJECTS_ROOT / slug).glob("*.jsonl")):
+        cwd = read_cwd_from_transcript(jsonl_file)
+        if cwd:
+            return cwd
+    return None
+
+
+def _project_opted_out(slug: str) -> bool:
+    if slug not in _OPT_OUT_CACHE:
+        _OPT_OUT_CACHE[slug] = sr.project_opted_out(_slug_cwd(slug))
+    return _OPT_OUT_CACHE[slug]
+
+
 def _is_excluded_slug(slug: str) -> bool:
-    return any(slug == p or slug.startswith(p + "-") for p in EXCLUDED_PREFIXES)
+    if any(slug == p or slug.startswith(p + "-") for p in EXCLUDED_PREFIXES):
+        return True
+    return _project_opted_out(slug)
 
 LAZY_SUMMARY_SCAN_CAP = 20    # newest stale sessions inspected for cache hits
 MAX_SUMMARY_CALLS_PER_RUN = 2 # hard cap on paid/model-backed work per /recap
@@ -669,6 +701,82 @@ def _last_user_prompt(path: Path, max_chars: int = 200) -> str | None:
     return ss._clip(normalized, max_chars)
 
 
+LIVE_SNAPSHOT_TAIL_BYTES = 64 * 1024
+_FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+
+def scan_live_snapshot(path: Path, tail_bytes: int = LIVE_SNAPSHOT_TAIL_BYTES) -> dict | None:
+    """Zero-model-call picture of an open session, from the transcript tail
+    only: the last typed prompt, the last assistant text, tool-call counts
+    and recently edited files. Reads at most `tail_bytes`, so the cost is
+    flat no matter how long the session is. Returns None if the tail has
+    nothing usable; never guesses."""
+    try:
+        with path.open("rb") as f:
+            size = f.seek(0, 2)
+            start = max(0, size - tail_bytes)
+            f.seek(start)
+            raw = f.read()
+    except OSError:
+        return None
+    lines = raw.decode("utf-8", errors="ignore").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # first line is likely cut mid-record
+
+    prompt = None
+    latest = None
+    tools: dict[str, int] = {}
+    files: list[str] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = d.get("message") or {}
+        content = message.get("content")
+        if d.get("type") == "user" and d.get("turnOrigin") == "human":
+            for value in ss._text_blocks(content):
+                if value.strip():
+                    prompt = value
+        elif d.get("type") == "assistant":
+            for value in ss._text_blocks(content):
+                if value.strip():
+                    latest = value
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    name = str(block.get("name") or "")
+                    if not name:
+                        continue
+                    tools[name] = tools.get(name, 0) + 1
+                    target = (block.get("input") or {}).get("file_path")
+                    if name in _FILE_TOOLS and isinstance(target, str):
+                        base = Path(target).name
+                        if base in files:
+                            files.remove(base)
+                        files.append(base)
+
+    def tidy(text: str | None, limit: int) -> str | None:
+        if text is None:
+            return None
+        text = _WHITESPACE_RE.sub(" ", text).strip()
+        return ss._clip(text, limit) if text else None
+
+    snapshot = {
+        "prompt": tidy(prompt, 200),
+        "latest": tidy(latest, 280),
+        "tools": dict(sorted(tools.items(), key=lambda kv: -kv[1])[:5]),
+        "files": files[-5:],
+    }
+    if not (snapshot["prompt"] or snapshot["latest"] or snapshot["tools"] or snapshot["files"]):
+        return None
+    return snapshot
+
+
 def get_usage_stats(c: Combined) -> dict | None:
     """Cached, transcript-mtime-gated context-usage numbers for one session
     — recomputed only when the transcript has grown since it was last
@@ -783,6 +891,20 @@ def _is_live(c: Combined, now: datetime) -> bool:
     if last_active is None:
         return False
     return (now - last_active).total_seconds() < LIVE_THRESHOLD_SECONDS
+
+
+def _open_state(c: Combined, now: datetime) -> tuple[str | None, int]:
+    """("live" | "idle" | None, idle_minutes) for an OPEN session. Separate
+    from the summary status: it says whether the session is being used now,
+    not what its work amounted to."""
+    if _current_opened_at(c) is None:
+        return None, 0
+    last_active = _last_activity(c)
+    if last_active is None:
+        return None, 0
+    idle_seconds = max(0, int((now - last_active).total_seconds()))
+    state = "live" if idle_seconds < LIVE_THRESHOLD_SECONDS else "idle"
+    return state, idle_seconds // 60
 
 
 def run_lazy_summarization(combined: dict[str, Combined], force_session_id: str | None = None) -> None:
@@ -1056,6 +1178,19 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
 
         usage_stats = get_usage_stats(c)
 
+        open_state, idle_minutes = _open_state(c, now)
+        live_snapshot = (
+            scan_live_snapshot(c.transcript_path)
+            if open_state is not None and c.transcript_path is not None
+            else None
+        )
+        behind_bytes = None
+        if open_state is not None and c.record.get("summary"):
+            known = _current_known_bytes(c)
+            covered = c.record["summary"].get("summarized_through_bytes")
+            if known is not None and isinstance(covered, int) and known > covered:
+                behind_bytes = known - covered
+
         data.append(
             {
                 "project": project,
@@ -1079,6 +1214,10 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
                 "force_command": force_command,
                 "long_running_open": long_running_label is not None,
                 "long_running_label": long_running_label,
+                "live_state": open_state,
+                "idle_minutes": idle_minutes,
+                "live_snapshot": live_snapshot,
+                "summary_behind_bytes": behind_bytes,
                 "last_activity_valid": _is_plausible_ts(last_active_iso),
                 "context_peak_tokens": usage_stats["peak_context_tokens"] if usage_stats else None,
                 "context_total_output_tokens": usage_stats["total_output_tokens"] if usage_stats else None,
@@ -1219,6 +1358,10 @@ def add_legacy_no_id_entries(data: list[dict], no_id_entries: list[LegacyEntry])
                 "force_command": None,
                 "long_running_open": False,
                 "long_running_label": None,
+                "live_state": None,
+                "idle_minutes": 0,
+                "live_snapshot": None,
+                "summary_behind_bytes": None,
                 "last_activity_valid": _is_plausible_ts(e.ended_at),
             }
         )
@@ -1259,96 +1402,145 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
 <html>
 <head>
 <meta charset="utf-8">
-<title>Threadback</title>
+<title>recap. · Projects</title>
+<meta name="color-scheme" content="dark">
 <style>
   :root {{
-    color-scheme: light dark;
-    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --border: #e0e0e0;
-    --card-bg: #fafafa; --accent: #3457d5;
-    --completed: #1a7f37; --in-progress: #9a6700; --blocked: #cf222e; --unknown: #57606a; --active: #0969da;
-    --completed-bg: #e9f7ee; --in-progress-bg: #fdf2e0; --blocked-bg: #fdecea; --unknown-bg: #eef0f2; --active-bg: #ddf4ff;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #14161a; --fg: #e6e6e6; --muted: #9a9a9a; --border: #2a2d33;
-      --card-bg: #1b1e24; --accent: #7c9cff;
-      --completed-bg: #16261c; --in-progress-bg: #2a2115; --blocked-bg: #2b1a1a; --unknown-bg: #202329;
-      --active: #58a6ff; --active-bg: #172a3a;
-    }}
+    color-scheme: dark;
+    --bg: #101318; --surface: #191e25; --surface-hover: #1d242c;
+    --line: #2b323c; --line-soft: #262c35;
+    --fg: #ecf0f4; --muted: #a0aab8; --dim: #8b95a4;
+    --border: #2b323c; --card-bg: #191e25;
+    --accent: #68dec3; --accent-bg: #192e2b;
+    --completed: #2ea06a; --in-progress: #c9922e; --blocked: #e5534b; --unknown: #7d8896; --active: #4c9aff;
+    --completed-bg: #16261c; --in-progress-bg: #2a2115; --blocked-bg: #2b1a1a; --unknown-bg: #202329; --active-bg: #172a3a;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font: "DM Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }}
   * {{ box-sizing: border-box; }}
-  body {{ background: var(--bg); color: var(--fg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          margin: 0; padding: 0 16px 60px; }}
-  .wrap {{ max-width: 1180px; margin: 0 auto; }}
-  header.page-head {{ padding: 20px 0 12px; }}
-  h1 {{ font-size: 1.4rem; margin: 0 0 4px; }}
-  .subtitle {{ color: var(--muted); font-size: 0.85rem; }}
-  .how-summaries-work {{ color: var(--muted); font-size: 0.78rem; margin: 4px 0 16px; line-height: 1.4; }}
-  .how-summaries-work summary {{ cursor: pointer; color: var(--accent); font-weight: 600; list-style: none; }}
-  .how-summaries-work summary::-webkit-details-marker {{ display: none; }}
-  .how-summaries-work summary::before {{ content: "▸ "; }}
-  .how-summaries-work[open] summary::before {{ content: "▾ "; }}
-  .how-summaries-work p {{ margin: 6px 0 0; }}
-  .how-summaries-work code {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }}
+  html {{ scroll-behavior: smooth; }}
+  body {{ background: var(--bg); color: var(--fg); font: 1rem/1.55 var(--font); margin: 0;
+          -webkit-font-smoothing: antialiased; }}
+  ::selection {{ background: #68dec340; color: #fff; }}
+  .wrap {{ max-width: 1424px; margin: 0 auto; padding: 40px 48px 64px; }}
 
-  .controls {{ position: sticky; top: 0; z-index: 10; display: flex; gap: 8px; flex-wrap: wrap;
-           align-items: center; padding: 10px 0; margin-bottom: 8px; background: var(--bg);
-           border-bottom: 1px solid var(--border); }}
-  input[type=text] {{ background: var(--card-bg); color: var(--fg); border: 1px solid var(--border);
-           border-radius: 6px; padding: 8px 10px; font-size: 0.9rem; flex: 1; min-width: 180px; }}
-  button.clear-filters {{ background: none; color: var(--accent); border: none; font-size: 0.85rem;
-           cursor: pointer; padding: 8px 4px; text-decoration: underline; }}
+  .app-header {{ border-bottom: 1px solid var(--line-soft); background: #12161b; }}
+  .header-inner {{ max-width: 1424px; height: 78px; padding: 0 48px; display: flex; align-items: center;
+           gap: 26px; margin: 0 auto; }}
+  .brand {{ display: flex; align-items: center; gap: 12px; font-size: 1.6rem; font-weight: 700;
+           letter-spacing: -.065em; color: var(--fg); text-decoration: none; }}
+  .brand-mark {{ position: relative; width: 32px; height: 32px; display: grid; place-items: center;
+           color: var(--accent); background: #21322f; font: 700 22px/1 var(--font); border-radius: 9px;
+           letter-spacing: -.05em; }}
+  .brand-mark span {{ position: absolute; width: 4px; height: 4px; background: var(--accent);
+           bottom: 5px; right: 5px; border-radius: 1px; }}
+  .brand-period {{ color: var(--accent); }}
+  .header-divider {{ height: 20px; width: 1px; background: var(--line); }}
+  .workspace-label {{ font-size: .875rem; color: var(--muted); }}
+  .private-label {{ margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: .8125rem;
+           color: var(--muted); }}
+  .private-label svg {{ width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6;
+           stroke-linecap: round; stroke-linejoin: round; }}
+
+  .eyebrow {{ font: 500 .75rem/1.5 var(--mono); color: var(--accent); letter-spacing: .12em;
+           text-transform: uppercase; margin: 0 0 9px; }}
+  .page-head {{ display: flex; justify-content: space-between; align-items: flex-end; gap: 24px;
+           margin-bottom: 26px; }}
+  h1 {{ font-size: 2.5rem; line-height: 1.15; letter-spacing: -.05em; font-weight: 600; margin: 0 0 11px; }}
+  .subtitle {{ color: var(--muted); max-width: 720px; }}
+  .overview-meta {{ display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: .875rem;
+           white-space: nowrap; padding-bottom: 5px; }}
+  .overview-meta strong {{ color: var(--fg); font-weight: 600; }}
+  .overview-meta .slash {{ color: var(--line); }}
+
+  .how-summaries-work {{ color: var(--muted); font-size: .8125rem; line-height: 1.5; margin: 0 0 24px;
+           border: 1px solid #31423f; background: #172522; border-radius: 9px; padding: 12px 16px; }}
+  .how-summaries-work summary {{ cursor: pointer; color: #d0eee5; font-weight: 600; list-style: none; }}
+  .how-summaries-work summary::-webkit-details-marker {{ display: none; }}
+  .how-summaries-work summary::before {{ content: "▸ "; color: var(--accent); }}
+  .how-summaries-work[open] summary::before {{ content: "▾ "; }}
+  .how-summaries-work p {{ margin: 8px 0 0; }}
+  .how-summaries-work code {{ background: var(--surface); border: 1px solid var(--line); border-radius: 3px;
+           padding: 0 4px; font-family: var(--mono); }}
+
+  .controls {{ display: flex; justify-content: space-between; align-items: center; gap: 20px;
+           margin-bottom: 23px; }}
+  .search-box {{ position: relative; max-width: 440px; width: 100%; display: flex; align-items: center; }}
+  .search-box > svg {{ position: absolute; left: 15px; width: 18px; height: 18px; color: var(--dim);
+           fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; pointer-events: none; }}
+  input[type=text] {{ width: 100%; background: #171c22; color: var(--fg); border: 1px solid #343d47;
+           border-radius: 9px; padding: 12px 16px 12px 44px; font: inherit; font-size: .875rem; line-height: 1.6; }}
+  input[type=text]::placeholder {{ color: var(--dim); }}
+  input[type=text]:focus {{ border-color: var(--accent); }}
+  button.clear-filters {{ background: none; color: var(--accent); border: none; font: inherit; font-size: .85rem;
+           cursor: pointer; padding: 8px 4px; text-decoration: underline; white-space: nowrap; }}
+  .controls-right {{ display: flex; align-items: center; gap: 16px; }}
+  .sort-label {{ display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: .8125rem;
+           white-space: nowrap; }}
+  .sort-label svg {{ width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.6;
+           stroke-linecap: round; }}
 
   section.session-section {{ margin-bottom: 32px; }}
   section.session-section > h2 {{ font-size: 1.05rem; font-weight: 700; margin: 0 0 12px; }}
 
-  .project-name {{ font-size: 1.05rem; font-weight: 700; }}
-  .project-path {{ font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  .project-name {{ font-size: 1.2rem; line-height: 1.4; font-weight: 600; letter-spacing: -.025em; }}
+  .project-path {{ font: .75rem/1.6 var(--mono); color: var(--dim); overflow-wrap: anywhere; }}
 
   /* --- project grid (home view) --- */
-  .project-grid {{ display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }}
-  @media (min-width: 760px) {{
-    .project-grid {{ grid-template-columns: repeat(2, 1fr); }}
-  }}
-  @media (min-width: 1140px) {{
-    .project-grid {{ grid-template-columns: repeat(3, 1fr); }}
-  }}
-  .project-card {{ display: block; width: 100%; text-align: left; background: var(--card-bg);
-           border: 1px solid var(--border); border-radius: 12px; padding: 16px; cursor: pointer;
-           font: inherit; color: var(--fg); }}
-  .project-card:hover {{ border-color: var(--accent); }}
-  .project-card-head {{ margin-bottom: 4px; }}
-  .project-card-activity {{ font-size: 0.74rem; color: var(--muted); margin-bottom: 10px; }}
-  .project-recap {{ font-size: 0.82rem; color: var(--fg); line-height: 1.4; margin-bottom: 10px;
+  .project-grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; align-items: stretch; }}
+  @media (min-width: 760px) {{ .project-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+  @media (min-width: 1200px) {{ .project-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }} }}
+  .project-card {{ display: flex; flex-direction: column; width: 100%; min-width: 0; text-align: left;
+           background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 0;
+           overflow: hidden; cursor: pointer; font: inherit; color: var(--fg);
+           transition: border-color .18s, transform .18s, box-shadow .18s; }}
+  .project-card:hover {{ border-color: #4a5868; transform: translateY(-2px); box-shadow: 0 10px 28px #0002; }}
+  .project-intro {{ padding: 24px 23px 19px; }}
+  .project-top {{ display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }}
+  .project-icon {{ width: 40px; height: 40px; display: grid; place-items: center; border-radius: 10px;
+           flex-shrink: 0; font-weight: 650; font-size: 1.05rem; text-transform: uppercase;
+           color: hsl(var(--chip-hue) 70% 72%); background: hsl(var(--chip-hue) 40% 20%); }}
+  .project-card-head {{ min-width: 0; }}
+  .project-card-activity {{ font-size: .75rem; color: var(--dim); margin-top: 1px; }}
+  .project-recap {{ color: #c7ced7; font-size: 1rem; line-height: 1.6; margin: 16px 0 0; min-height: 3.2em;
            display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
            overflow: hidden; }}
-  .project-card-next {{ font-size: 0.82rem; margin-bottom: 10px; }}
-  .project-card-next .k {{ color: var(--accent); font-weight: 700; font-size: 0.72rem; text-transform: uppercase;
-           letter-spacing: 0.05em; margin-right: 6px; }}
-  .project-card-next.no-action {{ color: var(--muted); font-style: italic; }}
-  .project-preview {{ display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }}
-  .preview-row {{ display: flex; align-items: flex-start; gap: 7px; font-size: 0.82rem; }}
-  .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; margin-top: 3px; }}
+  .project-card-next {{ font-size: .875rem; color: var(--muted); line-height: 1.55;
+           border-left: 2px solid #49645c; margin: 0 23px 21px; padding: 0 0 0 11px; min-height: 3.1em;
+           display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
+           overflow: hidden; }}
+  .project-card-next .k {{ color: #c6e8dd; font-weight: 550; margin-right: 5px; }}
+  .project-card-next.no-action {{ font-style: italic; }}
+  .recent-header {{ display: flex; justify-content: space-between; color: var(--dim); font: .75rem var(--mono);
+           letter-spacing: .08em; margin: 0 23px 8px; text-transform: uppercase; }}
+  .project-preview {{ display: flex; flex-direction: column; margin: 0 23px 12px; }}
+  .preview-row {{ display: flex; align-items: flex-start; gap: 11px; padding: 11px 0;
+           border-top: 1px solid var(--line-soft); font-size: .875rem; line-height: 1.4; min-height: 59px; }}
+  .project-card:hover .preview-row:hover .preview-title {{ color: var(--accent); }}
+  .preview-dot {{ width: 8px; height: 8px; min-width: 8px; border-radius: 50%; margin-top: 6px; }}
   .preview-dot.completed {{ background: var(--completed); }}
   .preview-dot.in-progress {{ background: var(--in-progress); }}
   .preview-dot.blocked {{ background: var(--blocked); }}
   .preview-dot.unknown {{ background: var(--unknown); }}
   .preview-dot.active {{ background: var(--active); }}
-  .preview-title {{ flex: 1; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
-           -webkit-box-orient: vertical; overflow: hidden; }}
-  .preview-date {{ color: var(--muted); font-size: 0.74rem; white-space: nowrap; flex-shrink: 0; }}
-  .view-all-row {{ display: block; width: 100%; appearance: none; background: none; border: none;
-           color: var(--accent); font: inherit; font-size: 0.78rem; text-decoration: underline;
-           cursor: pointer; padding: 4px 0 0; text-align: left; }}
-  .view-all-row:hover {{ color: var(--fg); }}
+  .preview-title {{ flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2;
+           -webkit-box-orient: vertical; overflow: hidden; transition: color .15s; }}
+  .preview-date {{ font: .75rem/1.7 var(--mono); color: var(--dim); white-space: nowrap; flex-shrink: 0;
+           padding-top: 1px; }}
+  .project-foot {{ display: flex; justify-content: space-between; align-items: center; margin-top: auto;
+           padding: 15px 23px; border-top: 1px solid var(--line); background: #161c22; }}
+  .view-all-row {{ appearance: none; background: none; border: none; padding: 0; font: inherit;
+           font-size: .875rem; font-weight: 500; color: #c7ded7; cursor: pointer; text-align: left; }}
+  .view-all-row:hover {{ color: var(--accent); }}
+  .project-foot-note {{ color: var(--dim); font: .75rem var(--mono); }}
 
   /* --- project detail view --- */
   .back-link {{ background: none; border: none; color: var(--accent); cursor: pointer; font: inherit;
            font-size: 0.85rem; padding: 6px 0; margin-bottom: 8px; text-decoration: underline; }}
-  .detail-header {{ margin-bottom: 18px; padding-bottom: 12px; border-bottom: 2px solid var(--border); }}
+  .detail-header {{ margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }}
 
   .card {{ background: var(--card-bg); border: 1px solid var(--border); border-left: 4px solid var(--unknown);
-           border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }}
+           border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }}
   .card.completed {{ border-left-color: var(--completed); background: var(--completed-bg); }}
   .card.in-progress {{ border-left-color: var(--in-progress); background: var(--in-progress-bg); }}
   .card.blocked {{ border-left-color: var(--blocked); background: var(--blocked-bg); }}
@@ -1361,9 +1553,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
            font-size: 0.78rem; margin-bottom: 8px; }}
   .card-meta .project-chip {{ font-weight: 600; padding: 2px 8px; border-radius: 6px;
            color: hsl(var(--chip-hue) 65% 32%); background: hsl(var(--chip-hue) 65% 32% / 14%); }}
-  @media (prefers-color-scheme: dark) {{
-    .card-meta .project-chip {{ color: hsl(var(--chip-hue) 65% 72%); background: hsl(var(--chip-hue) 65% 72% / 16%); }}
-  }}
+  .card-meta .project-chip {{ color: hsl(var(--chip-hue) 65% 72%); background: hsl(var(--chip-hue) 65% 72% / 16%); }}
   .badge {{ font-size: 0.72rem; font-weight: 600; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }}
   .badge.completed {{ color: #fff; background: var(--completed); }}
   .badge.in-progress {{ color: #fff; background: var(--in-progress); }}
@@ -1378,11 +1568,12 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .card-next.no-action {{ color: var(--muted); font-style: italic; }}
   .card-provenance {{ font-size: 0.74rem; color: var(--muted); margin-bottom: 10px; }}
   .card-pending {{ font-size: 0.8rem; color: var(--unknown); font-style: italic; margin-bottom: 10px; }}
+  .card-live {{ font-size: 0.8rem; color: var(--muted); margin-bottom: 10px; display: grid; gap: 2px; }}
   .card-last-prompt {{ font-size: 0.8rem; color: var(--muted); margin-bottom: 10px; }}
 
   .card-actions {{ display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }}
   .btn {{ border-radius: 6px; padding: 6px 12px; font-size: 0.8rem; cursor: pointer; border: 1px solid transparent; }}
-  .btn-primary {{ background: var(--accent); color: white; border-color: var(--accent); }}
+  .btn-primary {{ background: var(--accent); color: #10241f; font-weight: 600; border-color: var(--accent); }}
   .btn-secondary {{ background: none; color: var(--fg); border-color: var(--border); }}
   .btn-primary.copied {{ background: var(--completed); border-color: var(--completed); }}
   .btn:disabled {{ cursor: not-allowed; opacity: 0.5; }}
@@ -1418,17 +1609,40 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
 
   button:focus-visible, input:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
 
+  @media (max-width: 800px) {{
+    .header-inner {{ padding: 0 24px; }}
+    .wrap {{ padding: 28px 24px 48px; }}
+    .page-head {{ display: block; }}
+    .overview-meta {{ margin-top: 14px; }}
+    h1 {{ font-size: 2rem; }}
+    .controls {{ flex-direction: column; align-items: flex-start; gap: 14px; }}
+  }}
+  @media (max-width: 620px) {{
+    .header-inner {{ height: 67px; gap: 18px; }}
+    .header-divider, .workspace-label {{ display: none; }}
+  }}
   @media (max-width: 480px) {{
     .card {{ padding: 12px; }}
   }}
 </style>
 </head>
 <body>
+<header class="app-header">
+  <div class="header-inner">
+    <a class="brand" href="#" aria-label="recap projects"><span class="brand-mark" aria-hidden="true">R<span></span></span><span>recap<span class="brand-period">.</span></span></a>
+    <div class="header-divider" aria-hidden="true"></div><span class="workspace-label">Your workspace</span>
+    <span class="private-label"><svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/></svg>Private workspace</span>
+  </div>
+</header>
 <div class="wrap">
-  <header class="page-head">
-    <h1>Threadback</h1>
-    <div class="subtitle" id="header-stats">Generated {generated_at}</div>
-  </header>
+  <div class="page-head" id="overview-head">
+    <div>
+      <p class="eyebrow">Pick up the thread</p>
+      <h1>Your projects</h1>
+      <div class="subtitle">What changed. Where you left off. What comes next.</div>
+    </div>
+    <div class="overview-meta" id="header-stats">Generated {generated_at}</div>
+  </div>
 
   <details class="how-summaries-work">
     <summary>How summaries work</summary>
@@ -1443,8 +1657,14 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   </details>
 
   <div class="controls">
-    <input type="text" id="search" placeholder="Search project name or path...">
-    <button class="clear-filters" id="clearFilters" hidden>Clear filters</button>
+    <div class="search-box">
+      <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input type="text" id="search" placeholder="Filter projects by name..." aria-label="Filter projects">
+    </div>
+    <div class="controls-right">
+      <button class="clear-filters" id="clearFilters" hidden>Clear filters</button>
+      <span class="sort-label"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h5"/></svg>Most recent first</span>
+    </div>
   </div>
 
   <section id="view-grid">
@@ -1468,7 +1688,7 @@ const SESSIONS = {data_json};
 SESSIONS.forEach((s, i) => {{ s.idx = i; }});
 const PROJECT_RECAPS = {recaps_json};
 
-const SOURCE_LABEL = {{"session_end": "session end", "recap_reconciliation": "recap check", "legacy_md": "earlier log"}};
+const SOURCE_LABEL = {{"session_end": "session end", "recap_reconciliation": "recap check", "live": "live update", "legacy_md": "earlier log"}};
 const GENERATED_AT = "{generated_at}";
 
 let searchQuery = "";
@@ -1519,7 +1739,7 @@ function projectHue(name) {{
 }}
 
 function badgeClass(session) {{
-  if (session.long_running_open) return "active";
+  if (session.long_running_open || session.live_state) return "active";
   return {{
     "Completed": "completed",
     "In Progress": "in-progress",
@@ -1528,7 +1748,10 @@ function badgeClass(session) {{
 }}
 
 function badgeLabel(session) {{
-  return session.long_running_open ? session.long_running_label : session.status;
+  if (session.long_running_open) return session.long_running_label;
+  if (session.live_state === "live") return "Live";
+  if (session.live_state === "idle") return `Open, idle ${{session.idle_minutes}}m`;
+  return session.status;
 }}
 
 function escapeHtml(str) {{
@@ -1693,7 +1916,24 @@ function buildCard(s, opts) {{
     card.appendChild(el("div", {{className: "card-pending", text: s.pending_label}}));
   }}
 
-  if (s.last_prompt) {{
+  if (s.live_snapshot) {{
+    const snap = s.live_snapshot;
+    const live = el("div", {{className: "card-live"}});
+    if (snap.prompt) live.appendChild(el("div", {{text: `Now: "${{snap.prompt}}"`}}));
+    if (snap.latest) live.appendChild(el("div", {{text: `Latest: ${{snap.latest}}`}}));
+    const toolText = Object.entries(snap.tools || {{}}).map(([k, v]) => `${{k}}×${{v}}`).join(", ");
+    if (toolText) live.appendChild(el("div", {{text: `Recent tools: ${{toolText}}`}}));
+    if (snap.files && snap.files.length) live.appendChild(el("div", {{text: `Files: ${{snap.files.join(", ")}}`}}));
+    card.appendChild(live);
+  }}
+
+  if (s.summary_behind_bytes) {{
+    const kb = Math.max(1, Math.round(s.summary_behind_bytes / 1024));
+    card.appendChild(el("div", {{className: "card-pending",
+      text: `Summary is behind: ${{kb}} KB of activity since it was written.`}}));
+  }}
+
+  if (s.last_prompt && !s.live_snapshot) {{
     card.appendChild(el("div", {{className: "card-last-prompt",
       text: `Last prompt: "${{s.last_prompt}}"`}}));
   }}
@@ -1782,8 +2022,34 @@ function renderHeaderStats() {{
   const sessionCount = SESSIONS.length;
   const projectWord = projectCount === 1 ? "project" : "projects";
   const sessionWord = sessionCount === 1 ? "session" : "sessions";
-  document.getElementById("header-stats").textContent =
-    `${{projectCount}} ${{projectWord}} · ${{sessionCount}} ${{sessionWord}} · updated ${{GENERATED_AT}}`;
+  const stats = document.getElementById("header-stats");
+  stats.title = "Updated " + GENERATED_AT;
+  stats.innerHTML = "";
+  const part = (n, word) => {{
+    const span = document.createElement("span");
+    const b = document.createElement("strong");
+    b.textContent = String(n);
+    span.appendChild(b);
+    span.appendChild(document.createTextNode(" " + word));
+    return span;
+  }};
+  stats.appendChild(part(projectCount, projectWord));
+  stats.appendChild(el("span", {{className: "slash", text: "/"}}));
+  stats.appendChild(part(sessionCount, sessionWord));
+}}
+
+function formatShortDateTime(iso) {{
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const date = d.toLocaleDateString(undefined, {{day: "numeric", month: "short"}});
+  const time = d.toLocaleTimeString(undefined, {{hour: "2-digit", minute: "2-digit", hour12: false}});
+  return `${{date}} · ${{time}}`;
+}}
+
+function formatShortDate(iso) {{
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, {{day: "numeric", month: "short"}});
 }}
 
 function matchesSearch(s) {{
@@ -1851,22 +2117,27 @@ function renderProjectGrid(filtered) {{
     const sessions = groups.get(project);
     const card = el("button", {{className: "project-card"}});
     card.type = "button";
+    card.style.setProperty("--chip-hue", String(projectHue(project)));
 
+    const intro = el("div", {{className: "project-intro"}});
+    const top = el("div", {{className: "project-top"}});
+    top.appendChild(el("span", {{className: "project-icon", text: (project.match(/[A-Za-z0-9]/) || ["?"])[0]}}));
     const head = el("div", {{className: "project-card-head"}});
     head.appendChild(el("div", {{className: "project-name", text: project}}));
-    head.appendChild(el("div", {{className: "project-path", text: sessions[0].cwd_short}}));
-    card.appendChild(head);
-
     const latestValid = latestValidEndedAt(sessions);
     const longRunning = sessions.find(s => s.long_running_open);
-    card.appendChild(el("div", {{className: "project-card-activity",
+    head.appendChild(el("div", {{className: "project-card-activity",
       text: longRunning ? longRunning.long_running_label :
-        (latestValid ? `Last used ${{formatRelative(latestValid)}}` : "Date unavailable")}}));
+        (latestValid ? `Last session ${{formatShortDateTime(latestValid)}}` : "Date unavailable")}}));
+    top.appendChild(head);
+    intro.appendChild(top);
+    intro.appendChild(el("div", {{className: "project-path", text: sessions[0].cwd_short}}));
 
     const recap = PROJECT_RECAPS[project];
     if (recap) {{
-      card.appendChild(el("div", {{className: "project-recap", text: recap}}));
+      intro.appendChild(el("div", {{className: "project-recap", text: recap}}));
     }}
+    card.appendChild(intro);
 
     const nextInfo = projectNextAction(sessions);
     const nextLine = el("div", {{className: "project-card-next" + (nextInfo.kind === "none" ? " no-action" : "")}});
@@ -1874,26 +2145,35 @@ function renderProjectGrid(filtered) {{
     nextLine.appendChild(document.createTextNode(nextInfo.text));
     card.appendChild(nextLine);
 
+    const shown = sessions.slice(0, 4);
+    const pad = (n) => String(n).padStart(2, "0");
+    const recentHead = el("div", {{className: "recent-header"}});
+    recentHead.appendChild(el("span", {{text: "Recent sessions"}}));
+    recentHead.appendChild(el("span", {{text: `${{pad(shown.length)}} / ${{pad(sessions.length)}}`}}));
+    card.appendChild(recentHead);
+
     const preview = el("div", {{className: "project-preview"}});
-    for (const s of sessions.slice(0, 3)) {{
+    for (const s of shown) {{
       const row = el("div", {{className: "preview-row"}});
       row.appendChild(el("span", {{className: "preview-dot " + badgeClass(s)}}));
       row.appendChild(el("span", {{className: "preview-title", text: s.title}}));
       row.appendChild(el("span", {{className: "preview-date",
         text: s.long_running_open ? s.long_running_label :
-          (s.last_activity_valid ? formatRelative(s.ended_at) : "Date unavailable")}}));
+          (s.last_activity_valid ? formatShortDate(s.ended_at) : "Date unavailable")}}));
       preview.appendChild(row);
     }}
     card.appendChild(preview);
 
+    const foot = el("div", {{className: "project-foot"}});
     const viewAll = el("button", {{className: "view-all-row",
-      text: `View all ${{sessions.length}} session${{sessions.length === 1 ? "" : "s"}} →`}});
+      text: `View all ${{sessions.length}} session${{sessions.length === 1 ? "" : "s"}}`}});
     viewAll.type = "button";
     viewAll.addEventListener("click", (e) => {{
       e.stopPropagation();
       location.hash = "project=" + encodeURIComponent(project);
     }});
-    card.appendChild(viewAll);
+    foot.appendChild(viewAll);
+    card.appendChild(foot);
 
     card.addEventListener("click", () => {{
       location.hash = "project=" + encodeURIComponent(project);
@@ -1928,6 +2208,7 @@ function render() {{
 
   const filtered = SESSIONS.filter(s => matchesSearch(s));
 
+  document.getElementById("overview-head").hidden = currentView !== "grid";
   document.getElementById("view-grid").hidden = currentView !== "grid";
   document.getElementById("view-detail").hidden = currentView !== "detail";
 

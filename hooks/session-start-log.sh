@@ -34,6 +34,10 @@ if [ -z "$PROJECT_SLUG" ]; then
   exit 0
 fi
 
+if python3 "$RECORD_HELPER" opted-out "$CWD" 2>/dev/null; then
+  exit 0
+fi
+
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DATA="$(python3 -c 'import json,sys; print(json.dumps({"started_at": sys.argv[1], "source": sys.argv[2], "cwd": sys.argv[3]}))' "$STARTED_AT" "$SOURCE" "$CWD")"
 
