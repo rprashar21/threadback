@@ -202,9 +202,112 @@ class DeterministicProjectRecapTests(unittest.TestCase):
 
         self.assertEqual(
             recap,
-            "Recent work spans: Added content-hash caching; Investigated transcript size limits. "
+            "Recent work: Added content-hash caching. Earlier: Investigated transcript size limits. "
             "Next: Run the full verification suite.",
         )
+
+    def test_strips_evidence_tags_and_keeps_three_subjects_newest_first(self):
+        summaries = [
+            {"completed": "[Verified] Wrote the skill files.", "worked_on": "", "next_action": ""},
+            {"completed": "[Uncertain] Ported the dark UI.", "worked_on": "", "next_action": ""},
+            {"completed": "[Discussed] [Verified] Generated the dashboard.", "worked_on": "", "next_action": ""},
+            {"completed": "Fourth item is dropped.", "worked_on": "", "next_action": ""},
+        ]
+
+        recap = dashboard.deterministic_project_recap(summaries)
+
+        self.assertEqual(
+            recap,
+            "Recent work: Wrote the skill files. Earlier: Ported the dark UI; Generated the dashboard.",
+        )
+        self.assertNotIn("[", recap)
+
+    def test_strips_tags_behind_a_bullet_marker(self):
+        recap = dashboard.deterministic_project_recap([
+            {"completed": "- [Verified] Wrote the skill files.\n- [Verified] Ran the tests.",
+             "worked_on": "", "next_action": "- [Verified] Answer the quiz."},
+        ])
+
+        self.assertEqual(recap, "Recent work: Wrote the skill files. Next: Answer the quiz.")
+
+    def test_long_fragment_is_cut_at_a_word_boundary(self):
+        long_sentence = "word " * 100
+        recap = dashboard.deterministic_project_recap(
+            [{"completed": long_sentence, "worked_on": "", "next_action": ""}]
+        )
+
+        self.assertTrue(recap.endswith("…."), recap[-10:])
+        self.assertLessEqual(len(recap), 260)
+        self.assertNotIn("wor…", recap)
+
+
+class ProjectNarrativeTests(unittest.TestCase):
+    SUMMARIES = [
+        {"status": "Completed", "worked_on": "Built the dark UI.", "completed": "Ported tokens.",
+         "next_action": "None."},
+        {"status": "In Progress", "worked_on": "Wrote a teaching skill.", "completed": "Nothing notable.",
+         "next_action": "Run a practice round."},
+    ]
+
+    def test_disabled_by_default_makes_no_model_call(self):
+        with mock.patch.dict("os.environ", {}, clear=False), \
+             mock.patch.object(dashboard.ss, "run_project_narrative") as run:
+            dashboard.os.environ.pop("RECAP_PROJECT_SUMMARY", None)
+            self.assertFalse(dashboard.project_narrative_enabled())
+            run.assert_not_called()
+
+    def test_digest_is_oldest_first_and_bounded(self):
+        digest = dashboard.build_project_digest(self.SUMMARIES)
+
+        self.assertLess(digest.index("Wrote a teaching skill"), digest.index("Built the dark UI"))
+        self.assertLessEqual(len(digest), dashboard.PROJECT_DIGEST_MAX_CHARS)
+
+    def test_cache_hit_skips_model_and_changed_input_regenerates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "project_recap.json"
+            calls = []
+
+            def fake(project, digest, **_):
+                calls.append(digest)
+                return "Narrative text."
+
+            with mock.patch.object(dashboard.ss, "run_project_narrative", side_effect=fake):
+                budget = {"left": 2}
+                first = dashboard.project_narrative(cache, "proj", self.SUMMARIES, budget)
+                second = dashboard.project_narrative(cache, "proj", self.SUMMARIES, budget)
+                changed = dashboard.project_narrative(
+                    cache, "proj", self.SUMMARIES + [{"worked_on": "New thing.", "completed": ""}], budget)
+
+            self.assertEqual((first, second, changed), ("Narrative text.",) * 3)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(budget["left"], 0)
+
+    def test_cached_narrative_is_used_without_the_flag_but_never_generated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "project_recap.json"
+            with mock.patch.object(dashboard.ss, "run_project_narrative", return_value="Cached text.") as run:
+                dashboard.project_narrative(cache, "proj", self.SUMMARIES, {"left": 1})
+                run.reset_mock()
+                hit = dashboard.project_narrative(cache, "proj", self.SUMMARIES, {"left": 1}, generate=False)
+                miss = dashboard.project_narrative(
+                    cache, "proj", self.SUMMARIES + [{"worked_on": "New.", "completed": ""}],
+                    {"left": 1}, generate=False)
+            self.assertEqual(hit, "Cached text.")
+            self.assertIsNone(miss)
+            run.assert_not_called()
+
+    def test_session_titles_and_summaries_drop_evidence_tags(self):
+        summary = dashboard.make_summary("- [Verified] Created the skill files.", "")
+        self.assertEqual(summary, "Created the skill files.")
+        self.assertFalse(dashboard.make_title("", "- [Uncertain] Ran the tests.", "proj").startswith("["))
+
+    def test_budget_exhausted_returns_none_without_calling_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(dashboard.ss, "run_project_narrative") as run:
+                result = dashboard.project_narrative(
+                    Path(tmp) / "project_recap.json", "proj", self.SUMMARIES, {"left": 0})
+            self.assertIsNone(result)
+            run.assert_not_called()
 
     def test_returns_none_without_meaningful_summary(self):
         self.assertIsNone(dashboard.deterministic_project_recap([

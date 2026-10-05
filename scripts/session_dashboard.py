@@ -28,7 +28,9 @@ session's summary immediately, bypassing the per-run cap.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shlex
 import sys
@@ -1034,7 +1036,7 @@ def make_summary(worked_on: str, completed: str) -> str:
     for candidate in (worked_on, completed):
         norm = candidate.strip().rstrip(".").lower()
         if norm and norm != "nothing notable":
-            sentence = _first_sentence(candidate)
+            sentence = _strip_evidence_tags(_first_sentence(candidate))
             if sentence:
                 return sentence
     return "No summary available."
@@ -1054,7 +1056,7 @@ def _strip_title_leadin(basis: str) -> str:
 
 
 def make_title(summary: str, worked_on: str, project: str) -> str:
-    basis = summary if summary and summary not in ("No summary available.", "Not yet summarized.") else _first_sentence(worked_on)
+    basis = summary if summary and summary not in ("No summary available.", "Not yet summarized.") else _strip_evidence_tags(_first_sentence(worked_on))
     basis = basis.rstrip(".!?")
     basis = _strip_title_leadin(basis)
     words = basis.split()
@@ -1265,14 +1267,33 @@ def _session_summary_for_recap(c: Combined) -> dict | None:
     }
 
 
+# Evidence tags the session summarizer prefixes onto claims, e.g. "[Verified]".
+_EVIDENCE_TAG_PREFIX_RE = re.compile(r"^\s*(?:\[[A-Za-z ]{3,15}\]\s*)+")
+RECAP_FRAGMENT_MAX_CHARS = 240
+PROJECT_RECAP_MAX_SUBJECTS = 3
+
+
+def _strip_evidence_tags(text: str) -> str:
+    return _EVIDENCE_TAG_PREFIX_RE.sub("", text, count=1)
+
+
+def _trim_at_word(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;:")
+    return (cut or text[:limit]) + "…"
+
+
 def _recap_fragment(summary: dict) -> str | None:
     for field in ("completed", "worked_on"):
         value = _as_text(summary.get(field), "")
-        if value.strip().rstrip(".").lower() == "nothing notable":
+        if _strip_evidence_tags(value).strip().rstrip(".").lower() == "nothing notable":
             continue
-        fragment = _first_sentence(value).strip().rstrip(".!?")
+        # Fields are bullet lists ("- [Verified] ..."), so the tag only sits
+        # at the start once _first_sentence has removed the bullet marker.
+        fragment = _strip_evidence_tags(_first_sentence(value)).strip().rstrip(".!?")
         if fragment:
-            return fragment[:240].rstrip()
+            return _trim_at_word(fragment, RECAP_FRAGMENT_MAX_CHARS)
     return None
 
 
@@ -1289,21 +1310,93 @@ def deterministic_project_recap(summaries: list[dict]) -> str | None:
         if next_action is None and raw_next and not NO_ACTION_RE.match(raw_next):
             required, _optional = split_next_action(str(summary.get("status", "Unknown")), raw_next)
             if required and not NO_ACTION_RE.match(required):
-                next_action = _first_sentence(required).strip().rstrip(".!?")[:240]
+                next_action = _trim_at_word(
+                    _strip_evidence_tags(_first_sentence(required)).strip().rstrip(".!?"),
+                    RECAP_FRAGMENT_MAX_CHARS,
+                )
 
     if not subjects:
         return None
-    if len(subjects) == 1:
-        recap = f"Recent work: {subjects[0]}."
-    else:
-        recap = f"Recent work spans: {subjects[0]}; {subjects[1]}."
+    subjects = subjects[:PROJECT_RECAP_MAX_SUBJECTS]
+    recap = f"Recent work: {subjects[0]}."
+    if len(subjects) > 1:
+        recap += f" Earlier: {'; '.join(subjects[1:])}."
     if next_action:
         recap += f" Next: {next_action}."
     return recap
 
 
+# --- Opt-in model-written project narrative ---------------------------------
+# Off unless RECAP_PROJECT_SUMMARY=1. Input is the project's existing session
+# summaries (never transcripts), capped, and the result is cached per project
+# keyed on a hash of that input, so an unchanged project costs nothing.
+PROJECT_NARRATIVE_PROMPT_VERSION = "project-narrative-v2"
+PROJECT_DIGEST_MAX_CHARS = 6_000
+PROJECT_DIGEST_FIELD_CHARS = 500
+MAX_PROJECT_NARRATIVE_CALLS_PER_RUN = 2
+
+
+def project_narrative_enabled() -> bool:
+    return os.environ.get("RECAP_PROJECT_SUMMARY") == "1"
+
+
+def build_project_digest(summaries: list[dict]) -> str:
+    """Existing session summaries, oldest first, as bounded plain text."""
+    blocks: list[str] = []
+    for summary in reversed(summaries):  # summaries arrive newest first
+        parts = []
+        for label, key in (("Status", "status"), ("Worked on", "worked_on"),
+                           ("Completed", "completed"), ("Next", "next_action")):
+            value = _as_text(summary.get(key), "").strip()
+            value = re.sub(r"(?m)^(\s*[-*]\s*)?(?:\[[A-Za-z ]{3,15}\]\s*)+", r"\1", value)
+            if value:
+                parts.append(f"{label}: {value[:PROJECT_DIGEST_FIELD_CHARS]}")
+        if parts:
+            blocks.append(" | ".join(parts))
+    digest = "\n".join(f"{i}. {b}" for i, b in enumerate(blocks, 1))
+    return digest[:PROJECT_DIGEST_MAX_CHARS]
+
+
+def project_narrative(cache_path: Path, project: str, summaries: list[dict], budget: dict,
+                      generate: bool = True) -> str | None:
+    """Cached narrative for one project, or None (caller falls back to the
+    deterministic recap). A cache hit is free and always used. Only when
+    `generate` is true does a miss spend one unit of budget["left"] on a model call."""
+    digest = build_project_digest(summaries)
+    if not digest:
+        return None
+    input_hash = hashlib.sha256(
+        f"{PROJECT_NARRATIVE_PROMPT_VERSION}\n{digest}".encode()
+    ).hexdigest()
+    try:
+        cached = json.loads(cache_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        cached = None
+    if isinstance(cached, dict) and cached.get("input_hash") == input_hash and cached.get("narrative"):
+        return str(cached["narrative"])
+    if not generate or budget.get("left", 0) <= 0:
+        return None
+    budget["left"] -= 1
+    narrative = ss.run_project_narrative(project, digest)
+    if not narrative:
+        return None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_name(f".{cache_path.name}.tmp-{os.getpid()}.json")
+        tmp.write_text(json.dumps({
+            "input_hash": input_hash,
+            "narrative": narrative,
+            "prompt_version": PROJECT_NARRATIVE_PROMPT_VERSION,
+            "generated_at": _iso(_now()),
+        }))
+        tmp.replace(cache_path)
+    except OSError:
+        pass
+    return narrative
+
+
 def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
-    """Build project recaps locally with no additional model calls."""
+    """Build project recaps locally. Model-free unless RECAP_PROJECT_SUMMARY=1."""
     by_slug: dict[str, list[Combined]] = {}
     for c in combined.values():
         slug = _effective_slug(c)
@@ -1312,8 +1405,15 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
         by_slug.setdefault(slug, []).append(c)
 
     recaps: dict[str, str] = {}
-    for slug, sessions in by_slug.items():
-        sessions.sort(key=lambda c: _last_activity(c) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    budget = {"left": MAX_PROJECT_NARRATIVE_CALLS_PER_RUN}
+    use_narrative = project_narrative_enabled()
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    for sessions in by_slug.values():
+        sessions.sort(key=lambda c: _last_activity(c) or floor, reverse=True)
+    # Most recently active projects first, so the per-run model budget goes to
+    # the cards the user is most likely to look at.
+    ordered = sorted(by_slug.items(), key=lambda kv: _last_activity(kv[1][0]) or floor, reverse=True)
+    for slug, sessions in ordered:
         summarized = [_session_summary_for_recap(c) for c in sessions]
         summarized = [s for s in summarized if s][:PROJECT_RECAP_CANDIDATE_COUNT]
         if not summarized:
@@ -1322,6 +1422,13 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
         rep_cwd = next((c.cwd for c in sessions if c.cwd), None)
         display_name = project_display_name(rep_cwd, slug)
         recap_text = deterministic_project_recap(summarized)
+        if recap_text:
+            narrative = project_narrative(
+                LOG_ROOT / slug / PROJECT_RECAP_FILENAME, display_name, summarized, budget,
+                generate=use_narrative,
+            )
+            if narrative:
+                recap_text = narrative
         if recap_text:
             recaps[display_name] = recap_text
 
@@ -1503,7 +1610,7 @@ def render_html(data: list[dict], project_recaps: dict[str, str] | None = None) 
   .project-card-head {{ min-width: 0; }}
   .project-card-activity {{ font-size: .75rem; color: var(--dim); margin-top: 1px; }}
   .project-recap {{ color: #c7ced7; font-size: 1rem; line-height: 1.6; margin: 16px 0 0; min-height: 3.2em;
-           display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical;
+           display: -webkit-box; -webkit-line-clamp: 8; line-clamp: 8; -webkit-box-orient: vertical;
            overflow: hidden; }}
   .project-card-next {{ font-size: .875rem; color: var(--muted); line-height: 1.55;
            border-left: 2px solid #49645c; margin: 0 23px 21px; padding: 0 0 0 11px; min-height: 3.1em;
