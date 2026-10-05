@@ -438,3 +438,65 @@ def run_bounded_summary(
         "evidence_chars": prepared.input_chars,
     }
     return sr.merge_section(project_slug, session_id, "summary", data, summary_at)
+
+
+PROJECT_NARRATIVE_PROMPT = (
+    "Read the file {digest_path}. It lists the recent session summaries of one "
+    "software project, oldest first. Write 2 to 3 short plain sentences, under "
+    "350 characters in total, telling the project owner what has happened in "
+    "the project so far: what they were working on, what got done, and where "
+    "it stands. Use only facts in the "
+    "file. Do not copy bracketed evidence tags, and do not invent detail. "
+    "Write only that text to {out_path} using the Write tool."
+)
+
+
+def run_project_narrative(project: str, digest: str, timeout_secs: int = 90) -> str | None:
+    """One bounded `claude -p` call that turns existing session summaries (not
+    transcripts) into a short project narrative. Same recursion guards as
+    run_bounded_summary: env var plus the isolated scratch cwd, which is also
+    where the temp files live. Returns None on any failure."""
+    SUMMARIZER_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+    tag = f"{os.getpid()}-{int(datetime.now(timezone.utc).timestamp())}"
+    digest_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-digest-{tag}.txt"
+    out_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-narrative-{tag}.txt"
+    stderr_path = SUMMARIZER_SCRATCH_DIR / f".tmp-project-stderr-{tag}.log"
+    label = f"project narrative ({project})"
+    try:
+        digest_path.write_text(digest)
+    except OSError as e:
+        _log_failure(label, f"failed to write digest: {e}")
+        return None
+    prompt = PROJECT_NARRATIVE_PROMPT.format(digest_path=str(digest_path), out_path=str(out_path))
+    env = dict(os.environ)
+    env["CLAUDE_SESSION_LOG_SUMMARIZER"] = "1"
+    try:
+        with stderr_path.open("wb") as stderr_f:
+            proc = subprocess.Popen(
+                _claude_summary_command(prompt),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_f,
+                env=env,
+                cwd=str(SUMMARIZER_SCRATCH_DIR),
+                start_new_session=True,
+            )
+    except OSError as e:
+        _read_and_discard(digest_path)
+        _read_and_discard(stderr_path)
+        _log_failure(label, f"failed to launch claude -p: {e}")
+        return None
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_secs)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process_group(proc)
+    _read_and_discard(digest_path)
+    text = _read_and_discard(out_path).strip()
+    stderr_text = _read_and_discard(stderr_path)
+    if not text:
+        reason = f"timed out after {timeout_secs}s" if timed_out else f"exit code {proc.returncode}, no output written"
+        _log_failure(label, reason, stderr_text)
+        return None
+    return _clip(text, 450)
