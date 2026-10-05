@@ -9,7 +9,9 @@ end-of-session summaries are produced by a real local `claude -p` subprocess
 call. A deterministic local pass removes thinking, metadata, attachments, and
 oversized tool output first, then caps the evidence sent for each summary
 at 40,000 characters. Project recaps are assembled locally from those existing
-session summaries and make no additional model calls. This is therefore not a
+session summaries and make no additional model calls, unless you set
+`RECAP_PROJECT_SUMMARY=1`: then up to two projects per run get a short
+model-written narrative (built from the existing summaries, cached until they change). This is therefore not a
 fully offline pipeline, but model input is bounded and auditable.
 
 Dashboard backfill makes at most two sequential summary calls per run, accepts
