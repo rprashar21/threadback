@@ -974,8 +974,35 @@ def run_lazy_summarization(combined: dict[str, Combined], force_session_id: str 
 
 # --- Display-only derived fields --------------------------------------------
 
-def project_display_name(cwd: str | None, fallback_slug: str) -> str:
+def build_project_labels(cwds) -> dict[str, str]:
+    """cwd -> unique project label. A folder name shared by several distinct
+    clones gets enough parent folders appended, e.g. "app (work)" vs
+    "app (personal)", so same-named clones never merge into one project."""
+    by_name: dict[str, list[str]] = {}
+    for cwd in {c for c in cwds if c}:
+        by_name.setdefault(Path(cwd).name or cwd, []).append(cwd)
+    labels: dict[str, str] = {}
+    for name, group in by_name.items():
+        if len(group) == 1:
+            labels[group[0]] = name
+            continue
+        for depth in range(1, 64):
+            suffixes = {c: "/".join(Path(c).parts[-(depth + 1):-1]) for c in group}
+            if len(set(suffixes.values())) == len(group) or all(
+                len(Path(c).parts) <= depth + 1 for c in group
+            ):
+                break
+        for c in group:
+            labels[c] = f"{name} ({suffixes[c]})" if suffixes[c] else name
+    return labels
+
+
+def project_display_name(
+    cwd: str | None, fallback_slug: str, labels: dict[str, str] | None = None
+) -> str:
     if cwd:
+        if labels and cwd in labels:
+            return labels[cwd]
         return Path(cwd).name or cwd
     return f"(unknown project — {fallback_slug})"
 
@@ -1099,7 +1126,7 @@ def shorten_cwd(cwd: str | None) -> str:
     return cwd
 
 
-def build_session_data(combined: dict[str, Combined]) -> list[dict]:
+def build_session_data(combined: dict[str, Combined], labels: dict[str, str] | None = None) -> list[dict]:
     now = _now()
     data = []
 
@@ -1108,7 +1135,7 @@ def build_session_data(combined: dict[str, Combined]) -> list[dict]:
         fallback_slug = (
             c.transcript_path.parent.name if c.transcript_path is not None else "unknown"
         )
-        project = project_display_name(cwd, fallback_slug)
+        project = project_display_name(cwd, fallback_slug, labels)
 
         summary_section = c.record.get("summary")
         if not summary_section and c.legacy and not c.legacy.is_placeholder:
@@ -1395,7 +1422,7 @@ def project_narrative(cache_path: Path, project: str, summaries: list[dict], bud
     return narrative
 
 
-def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
+def run_project_recaps(combined: dict[str, Combined], labels: dict[str, str] | None = None) -> dict[str, str]:
     """Build project recaps locally. Model-free unless RECAP_PROJECT_SUMMARY=1."""
     by_slug: dict[str, list[Combined]] = {}
     for c in combined.values():
@@ -1420,7 +1447,7 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
             continue
 
         rep_cwd = next((c.cwd for c in sessions if c.cwd), None)
-        display_name = project_display_name(rep_cwd, slug)
+        display_name = project_display_name(rep_cwd, slug, labels)
         recap_text = deterministic_project_recap(summarized)
         if recap_text:
             narrative = project_narrative(
@@ -1435,9 +1462,11 @@ def run_project_recaps(combined: dict[str, Combined]) -> dict[str, str]:
     return recaps
 
 
-def add_legacy_no_id_entries(data: list[dict], no_id_entries: list[LegacyEntry]) -> None:
+def add_legacy_no_id_entries(
+    data: list[dict], no_id_entries: list[LegacyEntry], labels: dict[str, str] | None = None
+) -> None:
     for e in no_id_entries:
-        project = project_display_name(e.cwd, "unknown")
+        project = project_display_name(e.cwd, "unknown", labels)
         summary = make_summary(e.worked_on, e.completed)
         title = make_title(summary, e.worked_on, project)
         next_required, next_optional = split_next_action(e.status, e.next_action)
@@ -2376,10 +2405,13 @@ def generate_dashboard(force_session_id: str | None = None) -> Path:
     reconcile_orphans(combined, transcript_index)
     fill_missing_cwd_from_transcripts(combined)
 
-    project_recaps = run_project_recaps(combined)
+    labels = build_project_labels(
+        [c.cwd for c in combined.values()] + [e.cwd for e in legacy_no_id]
+    )
+    project_recaps = run_project_recaps(combined, labels)
 
-    data = build_session_data(combined)
-    add_legacy_no_id_entries(data, legacy_no_id)
+    data = build_session_data(combined, labels)
+    add_legacy_no_id_entries(data, legacy_no_id, labels)
 
     OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUT_FILE.write_text(render_html(data, project_recaps))

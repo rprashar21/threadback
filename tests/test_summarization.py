@@ -514,3 +514,24 @@ class LiveGateTests(unittest.TestCase):
                 self.assertEqual(
                     sr.live_tick("slug", "sid1", tmp, "/t.jsonl", cp, "2026-01-01T00:00:02Z"),
                     "not-due")
+
+
+class ProjectLabelTests(unittest.TestCase):
+    def test_unique_names_stay_plain(self):
+        labels = dashboard.build_project_labels(["/a/work/app", "/a/work/api"])
+        self.assertEqual(labels, {"/a/work/app": "app", "/a/work/api": "api"})
+
+    def test_same_name_clones_get_parent_suffix(self):
+        labels = dashboard.build_project_labels(["/h/work/app", "/h/personal/app", "/h/x/other"])
+        self.assertEqual(labels["/h/work/app"], "app (work)")
+        self.assertEqual(labels["/h/personal/app"], "app (personal)")
+        self.assertEqual(labels["/h/x/other"], "other")
+
+    def test_extends_until_unique(self):
+        labels = dashboard.build_project_labels(["/h/a/src/app", "/h/b/src/app"])
+        self.assertEqual(len(set(labels.values())), 2)
+        self.assertEqual(labels["/h/a/src/app"], "app (a/src)")
+
+    def test_none_cwd_ignored_and_fallback_kept(self):
+        self.assertEqual(dashboard.build_project_labels([None]), {})
+        self.assertIn("unknown project", dashboard.project_display_name(None, "slug", {}))
